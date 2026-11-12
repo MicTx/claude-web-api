@@ -1,0 +1,33 @@
+{
+  "name": "claude-web-api",
+  "version": "0.2.18",
+  "private": true,
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "type": "module",
+  "description": "通过本地浏览器中的 Claude 网页会话或备用 Messages API 获取第二意见，支持 web/api 两种模式与连续追问。",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "ccw": "bin/ccw.mjs"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "build:plugin": "node scripts/build-plugin.mjs",
+    "verify:plugin": "node scripts/verify-plugin.mjs",
+    "build:release": "node scripts/build-release.mjs",
+    "verify:structure": "node scripts/verify-structure.mjs",
+    "install:codex": "node scripts/install-codex.mjs",
+    "install:agents": "node scripts/install-agents.mjs",
+    "start:mcp": "node src/mcp-server.mjs",
+    "smoke:live": "node scripts/smoke-e2e.mjs --live"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1",
+    "smol-toml": "^1"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25",
+    "ws": "^8"
+  }
+}

@@ -1,0 +1,1213 @@
+import { constants, promises as fs, writeSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { parseArgs, promisify } from 'node:util';
+import { execFile } from 'node:child_process';
+import { BridgeError, errorResult } from '../src/core/errors.mjs';
+import { isMainModule } from '../src/is-main.mjs';
+import { parseStrictJson } from './design-probe-json.mjs';
+import { validDiscoveryRoutes } from './design-probe-discovery.mjs';
+import { readReconciliationBinding } from './design-probe-reconciliation.mjs';
+
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const SPEC = join(ROOT, '.spec/specs/2026-11-06_add-claude-design-integration/spec.md');
+const LEGACY_PHASES = ['source', 'mutations', 'versioned-files', 'acceptance'];
+const DISCOVERY_PHASES = [...LEGACY_PHASES, 'discovery'];
+const PHASES = [...DISCOVERY_PHASES, 'reconciliation'];
+const LIMITS = { reads: 64, sessions: 1, messages: 3, downloads: 12, uploads: 0, shares: 0 };
+const PHASE_EFFECTS = {
+  source: ['reads', 'downloads'],
+  mutations: ['reads', 'sessions', 'messages'],
+  'versioned-files': ['reads', 'downloads'],
+  acceptance: ['reads', 'messages', 'downloads'],
+  discovery: ['reads'],
+  reconciliation: ['reads'],
+};
+const PHASE_MESSAGE_LIMITS = { source: 0, mutations: 2, 'versioned-files': 0, acceptance: 1, discovery: 0, reconciliation: 0 };
+const PHASE_READ_LIMITS = { source: 64, mutations: 24, 'versioned-files': 6, acceptance: 8, discovery: 6, reconciliation: 4 };
+const MESSAGES = {
+  INVALID_ARGUMENT: 'Invalid live probe arguments',
+  LIVE_GUARD: 'The live probe authorization or ledger is invalid',
+  APPROVAL_UNSAFE: 'The approval file is unavailable or unsafe',
+  APPROVAL_INVALID: 'The approval file is malformed or outside its validity period',
+  APPROVAL_CHANGED: 'The approval file changed during the operation',
+  APPROVAL_SCOPE: 'The approval does not match the current task scope',
+  ROOT_UNSAFE: 'The evidence root is unavailable or unsafe',
+  LEDGER_UNSAFE: 'The existing ledger is unavailable or unsafe',
+  LEDGER_INVALID: 'The existing ledger is invalid or does not match the approval',
+  LEDGER_CHANGED: 'The ledger or a reservation marker changed',
+  LOCK_LOST: 'The probe lock was lost or changed',
+  BUDGET_EXHAUSTED: 'The approved probe budget is exhausted',
+  PHASE_UNAVAILABLE: 'The requested probe phase has not been implemented',
+  PHASE_UNRESOLVED: 'This phase was already attempted; inspect its ledger instead of retrying',
+  DESIGN_PROTOCOL_UNVERIFIED: 'The discovery evidence does not establish a verified Design submission contract',
+  APPROVAL_SUPERSEDED: 'The approval is no longer the active approval',
+  ROTATION_CONFLICT: 'The approval rotation cannot be safely completed',
+  SOURCE_UNVERIFIED: 'The passive source probe did not establish a verified original',
+  SOURCE_TIMEOUT: 'The passive source probe exceeded its deadline',
+  TARGET_CREATION_UNCERTAIN: 'The browser target creation result is uncertain; inspect the browser without guessing its identity',
+  UI_CONTEXT_LOST: 'The owned page is no longer safely controlled',
+  TURN_UNVERIFIED: 'The server history does not confirm the intended turn',
+  PENDING_BINDING_INVALID: 'The approved pending state is unavailable or changed',
+  CODE_CHANGED: 'The approved probe implementation has changed',
+  BUSY: 'Another process holds the probe lock',
+  ABORTED: 'The probe was cancelled; inspect the ledger before continuing',
+  PROBE_FAILED: 'The probe failed; inspect the ledger before continuing',
+};
+const APPROVAL_SCHEMA = 'ccw-design-probe-approval/2';
+const DISCOVERY_SCHEMA = 'ccw-design-probe-approval/3';
+const RECONCILIATION_SCHEMA = 'ccw-design-probe-approval/4';
+const LEDGER_SCHEMA = 'ccw-design-probe-ledger/1';
+const APPROVAL_SUMMARY = 'Synthetic source; one design; at most two revisions; no uploads or sharing';
+export const CODE_FILES = Object.freeze([
+  'scripts/design-probe-json.mjs', 'scripts/design-probe-live.mjs', 'scripts/design-probe-source.mjs',
+  'scripts/smoke-design.mjs', 'src/api-config.mjs', 'src/config.mjs', 'src/core/cdp.mjs',
+  'src/core/errors.mjs', 'src/is-main.mjs',
+  'scripts/design-probe-discovery.mjs',
+  'scripts/design-probe-turns.mjs', 'scripts/design-probe-mutations.mjs',
+  'src/core/claude-api.mjs', 'src/core/ui.mjs', 'src/session-store.mjs', 'src/attachments.mjs',
+  'scripts/design-probe-reconciliation.mjs',
+]);
+const LEDGER_NAME = 'ledger.json';
+const SNAPSHOT_DIR = 'approvals';
+const LOCK_NAME = '.design-probe.lock';
+const MARKER_PREFIX = '.design-reservation-';
+const MAX_FILE_BYTES = 128 * 1024;
+const MAX_CODE_BYTES = 2 * 1024 * 1024;
+const SOURCE_LIVE_READY = true;
+const DISCOVERY_LIVE_READY = true;
+const MUTATIONS_LIVE_READY = true;
+const MUTATION_PROMPT_ONLY_ACCEPTED = true;
+const HASH_RE = /^[a-f0-9]{64}$/;
+const ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{7,63}$/;
+const UUID_RE = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
+const ZERO_HASH = '0'.repeat(64);
+const execFileAsync = promisify(execFile);
+
+function fail(code) {
+  throw new BridgeError(code, MESSAGES[code] ?? MESSAGES.LIVE_GUARD);
+}
+
+function assert(condition, code = 'LIVE_GUARD') {
+  if (!condition) fail(code);
+}
+
+function checkAbort(signal) {
+  if (signal?.aborted) fail('ABORTED');
+}
+
+function safeFailure(error) {
+  let code = 'PROBE_FAILED';
+  const details = {};
+  try {
+    const candidate = error instanceof BridgeError ? error.code : null;
+    if (typeof candidate === 'string' && Object.hasOwn(MESSAGES, candidate)) {
+      code = candidate;
+      const remoteDetails = error.details;
+      for (const key of ['metadataMatched', 'sourceObserved', 'targetRetained', 'creationUncertain']) {
+        const value = remoteDetails?.[key];
+        if (typeof value === 'boolean') details[key] = value;
+      }
+    }
+  } catch {}
+  return new BridgeError(code, MESSAGES[code], details);
+}
+
+function digest(value) {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function exactKeys(value, keys) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
+}
+
+function isoTime(value) {
+  if (typeof value !== 'string') return null;
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) && date.toISOString() === value ? date.getTime() : null;
+}
+
+function inside(path, root) {
+  const suffix = relative(root, path);
+  return suffix === '' || (!suffix.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`)
+    && suffix !== '..' && !isAbsolute(suffix));
+}
+
+function sameFile(left, right) {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function privateFile(stat, mode, links = [1n]) {
+  return stat.isFile() && links.includes(stat.nlink) && stat.uid === BigInt(process.getuid())
+    && mode.includes(Number(stat.mode & 0o777n));
+}
+
+async function safeAncestors(path, code) {
+  const workspace = await fs.stat(ROOT, { bigint: true });
+  let parent = path;
+  for (;;) {
+    const stat = await fs.lstat(parent, { bigint: true });
+    const writable = (stat.mode & 0o022n) !== 0n;
+    const stickyRoot = stat.uid === 0n && (stat.mode & 0o1000n) !== 0n;
+    assert(stat.isDirectory() && !stat.isSymbolicLink() && !sameFile(stat, workspace) && (!writable || stickyRoot), code);
+    const next = dirname(parent);
+    if (next === parent) break;
+    parent = next;
+  }
+}
+
+async function readPrivateFile(path, code, modes = [0o400, 0o600], links = [1n]) {
+  let handle;
+  try {
+    assert(Number.isInteger(constants.O_NOFOLLOW) && typeof process.getuid === 'function', code);
+    assert(await fs.realpath(path) === path, code);
+    const namedBefore = await fs.lstat(path, { bigint: true });
+    assert(!namedBefore.isSymbolicLink() && privateFile(namedBefore, modes, links), code);
+    handle = await fs.open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const before = await handle.stat({ bigint: true });
+    assert(sameFile(namedBefore, before) && privateFile(before, modes, links) && before.size <= BigInt(MAX_FILE_BYTES), code);
+    const bytes = Buffer.alloc(MAX_FILE_BYTES + 1);
+    let size = 0;
+    while (size < bytes.length) {
+      const result = await handle.read(bytes, size, bytes.length - size, null);
+      if (result.bytesRead === 0) break;
+      size += result.bytesRead;
+    }
+    const after = await handle.stat({ bigint: true });
+    const namedAfter = await fs.lstat(path, { bigint: true });
+    assert(size <= MAX_FILE_BYTES && BigInt(size) === before.size && sameFile(before, after)
+      && sameFile(before, namedAfter) && privateFile(after, modes, links) && privateFile(namedAfter, modes, links)
+      && [after, namedAfter].every(stat => before.size === stat.size && before.mtimeNs === stat.mtimeNs
+        && before.ctimeNs === stat.ctimeNs), code);
+    return { bytes: bytes.subarray(0, size), stat: after };
+  } catch (error) {
+    if (error instanceof BridgeError) throw error;
+    fail(code);
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+async function privateDirectory(path) {
+  try {
+    assert(isAbsolute(path) && resolve(path) === path && !inside(path, ROOT), 'ROOT_UNSAFE');
+    assert(await fs.realpath(path) === path, 'ROOT_UNSAFE');
+    const root = await fs.lstat(path, { bigint: true });
+    assert(root.isDirectory() && !root.isSymbolicLink() && root.uid === BigInt(process.getuid())
+      && (root.mode & 0o777n) === 0o700n, 'ROOT_UNSAFE');
+    await safeAncestors(dirname(path), 'ROOT_UNSAFE');
+    return root;
+  } catch (error) {
+    if (error instanceof BridgeError) throw error;
+    fail('ROOT_UNSAFE');
+  }
+}
+
+function parseJson(bytes, code) {
+  try {
+    return parseStrictJson(bytes, { rejectPrototypeKeys: true });
+  } catch {
+    fail(code);
+  }
+}
+
+function validBudget(value) {
+  return exactKeys(value, Object.keys(LIMITS)) && Object.entries(LIMITS).every(([key, maximum]) =>
+    Number.isSafeInteger(value[key]) && value[key] >= 0 && value[key] <= maximum);
+}
+
+function validHistoricalCodeHashes(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const paths = Object.keys(value);
+  return paths.length > 0 && paths.length <= 64 && paths.every(path => path.length <= 256
+    && /^[A-Za-z0-9._/-]+$/.test(path) && !path.startsWith('/')
+    && path.split('/').every(segment => segment !== '' && segment !== '.' && segment !== '..'
+      && !['__proto__', 'constructor', 'prototype'].includes(segment))
+    && typeof value[path] === 'string' && HASH_RE.test(value[path]));
+}
+
+function validateApproval(value, now, { historical = false } = {}) {
+  const keys = ['schema', 'approvalId', 'issuer', 'scopeSummary', 'taskPack', 'codeHashes', 'evidenceRoot', 'sourceTarget', 'phases', 'limits', 'notBefore', 'expiresAt'];
+  assert(exactKeys(value, value?.schema === RECONCILIATION_SCHEMA ? [...keys, 'reconciliationTarget'] : keys)
+    && [APPROVAL_SCHEMA, DISCOVERY_SCHEMA, RECONCILIATION_SCHEMA].includes(value.schema) && typeof value.approvalId === 'string' && ID_RE.test(value.approvalId)
+    && value.issuer === 'host-under-user-authorization' && value.scopeSummary === APPROVAL_SUMMARY
+    && exactKeys(value.taskPack, ['branch', 'commit', 'specSha256'])
+    && typeof value.taskPack.branch === 'string' && value.taskPack.branch.length <= 200
+    && /^[a-f0-9]{40}$/.test(value.taskPack.commit) && HASH_RE.test(value.taskPack.specSha256)
+    && (historical ? validHistoricalCodeHashes(value.codeHashes)
+      : exactKeys(value.codeHashes, CODE_FILES) && CODE_FILES.every(path => typeof value.codeHashes[path] === 'string' && HASH_RE.test(value.codeHashes[path])))
+    && typeof value.evidenceRoot === 'string' && isAbsolute(value.evidenceRoot)
+    && exactKeys(value.sourceTarget, ['organizationId', 'frameId', 'shortId', 'version', 'size', 'sha256'])
+    && typeof value.sourceTarget.organizationId === 'string' && UUID_RE.test(value.sourceTarget.organizationId)
+    && typeof value.sourceTarget.frameId === 'string' && UUID_RE.test(value.sourceTarget.frameId)
+    && typeof value.sourceTarget.shortId === 'string' && /^[A-Za-z0-9_-]{10,80}$/.test(value.sourceTarget.shortId)
+    && typeof value.sourceTarget.version === 'string' && /^[A-Za-z0-9._-]{1,128}$/.test(value.sourceTarget.version)
+    && Number.isSafeInteger(value.sourceTarget.size) && value.sourceTarget.size > 0 && value.sourceTarget.size <= 2 * 1024 * 1024
+    && typeof value.sourceTarget.sha256 === 'string' && HASH_RE.test(value.sourceTarget.sha256)
+    && exactKeys(value.phases, value.schema === RECONCILIATION_SCHEMA ? PHASES : value.schema === DISCOVERY_SCHEMA ? DISCOVERY_PHASES : LEGACY_PHASES)
+    && Object.values(value.phases).every(enabled => enabled === 0 || enabled === 1)
+    && (value.schema !== RECONCILIATION_SCHEMA || exactKeys(value.reconciliationTarget,
+      ['organizationId', 'conversationId', 'parentMessageId', 'promptSha256', 'stateSha256'])
+      && value.reconciliationTarget.organizationId === value.sourceTarget.organizationId
+      && UUID_RE.test(value.reconciliationTarget.conversationId ?? '') && UUID_RE.test(value.reconciliationTarget.parentMessageId ?? '')
+      && HASH_RE.test(value.reconciliationTarget.promptSha256 ?? '') && HASH_RE.test(value.reconciliationTarget.stateSha256 ?? '')
+      && ['source', 'mutations', 'discovery', 'versioned-files'].every(phase => value.phases[phase] === 0)
+      && value.phases.acceptance <= 1)
+    && validBudget(value.limits), 'APPROVAL_INVALID');
+  const notBefore = isoTime(value.notBefore);
+  const expiresAt = isoTime(value.expiresAt);
+  assert(notBefore !== null && expiresAt !== null && notBefore <= now && now < expiresAt && notBefore < expiresAt, 'APPROVAL_INVALID');
+  return value;
+}
+
+async function readApproval(path, now, options) {
+  assert(typeof path === 'string' && isAbsolute(path) && resolve(path) === path && !inside(path, ROOT), 'APPROVAL_UNSAFE');
+  try { await safeAncestors(dirname(path), 'APPROVAL_UNSAFE'); } catch { fail('APPROVAL_UNSAFE'); }
+  const file = await readPrivateFile(path, 'APPROVAL_UNSAFE');
+  return { approval: validateApproval(parseJson(file.bytes, 'APPROVAL_INVALID'), now, options), hash: digest(file.bytes) };
+}
+
+async function currentScope() {
+  try {
+    const options = { cwd: ROOT, timeout: 5000, maxBuffer: 4096 };
+    const [branch, commit, spec] = await Promise.all([
+      execFileAsync('git', ['branch', '--show-current'], options),
+      execFileAsync('git', ['rev-parse', 'HEAD'], options),
+      fs.readFile(SPEC),
+    ]);
+    assert(spec.length <= 256 * 1024, 'APPROVAL_SCOPE');
+    return { branch: branch.stdout.trim(), commit: commit.stdout.trim(), specSha256: digest(spec) };
+  } catch {
+    fail('APPROVAL_SCOPE');
+  }
+}
+
+export async function computeCodeHashes() {
+  const hashes = {};
+  try {
+    for (const relativePath of CODE_FILES) {
+      const path = join(ROOT, relativePath);
+      assert(await fs.realpath(path) === path, 'CODE_CHANGED');
+      const named = await fs.lstat(path, { bigint: true });
+      assert(named.isFile() && !named.isSymbolicLink() && named.nlink === 1n && named.size <= BigInt(MAX_CODE_BYTES), 'CODE_CHANGED');
+      const handle = await fs.open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      try {
+        const before = await handle.stat({ bigint: true });
+        assert(sameFile(named, before) && before.isFile() && before.nlink === 1n && before.size <= BigInt(MAX_CODE_BYTES), 'CODE_CHANGED');
+        const hasher = createHash('sha256');
+        const buffer = Buffer.alloc(64 * 1024);
+        let size = 0;
+        for (;;) {
+          const result = await handle.read(buffer, 0, buffer.length, null);
+          if (!result.bytesRead) break;
+          size += result.bytesRead;
+          assert(size <= MAX_CODE_BYTES, 'CODE_CHANGED');
+          hasher.update(buffer.subarray(0, result.bytesRead));
+        }
+        const after = await handle.stat({ bigint: true });
+        const namedAfter = await fs.lstat(path, { bigint: true });
+        assert(BigInt(size) === before.size && [after, namedAfter].every(stat => sameFile(before, stat)
+          && stat.size === before.size && stat.mtimeNs === before.mtimeNs && stat.ctimeNs === before.ctimeNs), 'CODE_CHANGED');
+        hashes[relativePath] = hasher.digest('hex');
+      } finally {
+        await handle.close();
+      }
+    }
+    return hashes;
+  } catch {
+    fail('CODE_CHANGED');
+  }
+}
+
+async function matchCode(expected, getCodeHashes) {
+  let actual;
+  try { actual = await getCodeHashes(); } catch { fail('CODE_CHANGED'); }
+  assert(exactKeys(actual, CODE_FILES) && CODE_FILES.every(path => actual[path] === expected[path]), 'CODE_CHANGED');
+}
+
+function matchScope(expected, observed) {
+  assert(scopeMatches(expected, observed), 'APPROVAL_SCOPE');
+}
+
+function scopeMatches(expected, observed) {
+  return exactKeys(observed, ['branch', 'commit', 'specSha256'])
+    && expected.branch === observed.branch && expected.commit === observed.commit
+    && expected.specSha256 === observed.specSha256;
+}
+
+function recordHash(record) {
+  if (Object.hasOwn(record, 'resultSha256')) {
+    return digest(JSON.stringify([record.sequence, record.kind, record.phase, record.cost,
+      record.reservation, record.status, record.at, record.previous, record.resultSha256]));
+  }
+  return digest(JSON.stringify([record.sequence, record.kind, record.phase, record.cost,
+    record.reservation, record.status, record.at, record.previous]));
+}
+
+function markerName(record) {
+  if (record.kind === 'rotate') return `${MARKER_PREFIX}rotate-${String(record.reservation.generation).padStart(6, '0')}`;
+  return `${MARKER_PREFIX}${String(record.sequence).padStart(6, '0')}-${record.hash}`;
+}
+
+function markerContent(record) {
+  return record.kind === 'rotate' ? `${JSON.stringify(record)}\n` : `${markerName(record)}\n`;
+}
+
+function sameFields(left, right, keys) {
+  return keys.every(key => left[key] === right[key]);
+}
+
+function validateTransition(previous, next) {
+  const discoverySplit = previous.schema === APPROVAL_SCHEMA && next.schema === DISCOVERY_SCHEMA;
+  const reconciliationSplit = previous.schema === DISCOVERY_SCHEMA && next.schema === RECONCILIATION_SCHEMA;
+  assert((previous.schema === next.schema || discoverySplit || reconciliationSplit)
+    && sameFields(previous, next, ['approvalId', 'issuer', 'scopeSummary', 'evidenceRoot', 'notBefore', 'expiresAt'])
+    && sameFields(previous.taskPack, next.taskPack, ['branch', 'commit'])
+    && sameFields(previous.sourceTarget, next.sourceTarget, ['organizationId', 'frameId', 'shortId', 'version', 'size', 'sha256'])
+    && sameFields(previous.limits, next.limits, Object.keys(LIMITS))
+    && LEGACY_PHASES.every(phase => next.phases[phase] <= previous.phases[phase])
+    && (discoverySplit ? previous.phases.mutations === 1 && next.phases.mutations === 1 && next.phases.discovery === 1
+      : (next.phases.discovery ?? 0) <= (previous.phases.discovery ?? 0))
+    && (reconciliationSplit ? previous.phases['versioned-files'] === 1 && next.phases.reconciliation === 1
+      : (next.phases.reconciliation ?? 0) <= (previous.phases.reconciliation ?? 0))
+    && (previous.schema !== RECONCILIATION_SCHEMA || sameFields(previous.reconciliationTarget, next.reconciliationTarget,
+      ['organizationId', 'conversationId', 'parentMessageId', 'promptSha256', 'stateSha256'])), 'ROTATION_CONFLICT');
+}
+
+async function snapshotDirectory(root) {
+  const path = join(root, SNAPSHOT_DIR);
+  await privateDirectory(path);
+  return path;
+}
+
+async function readSnapshot(root, hash, now) {
+  assert(typeof hash === 'string' && HASH_RE.test(hash), 'LEDGER_INVALID');
+  const directory = await snapshotDirectory(root);
+  const file = await readPrivateFile(join(directory, `${hash}.json`), 'LEDGER_INVALID', [0o400]);
+  assert(digest(file.bytes) === hash, 'LEDGER_INVALID');
+  const approval = validateApproval(parseJson(file.bytes, 'LEDGER_INVALID'), now, { historical: true });
+  assert(approval.evidenceRoot === root, 'LEDGER_INVALID');
+  return { hash, approval };
+}
+
+async function approvalChain(root, ledger, suppliedApproval, suppliedHash, now) {
+  assert(ledger && Array.isArray(ledger.entries) && HASH_RE.test(ledger.approvalSha256 ?? ''), 'LEDGER_INVALID');
+  const rotations = ledger.entries.filter(record => record?.kind === 'rotate');
+  if (rotations.length === 0) {
+    assert(ledger.approvalSha256 === suppliedHash, 'LEDGER_INVALID');
+    return [{ hash: suppliedHash, approval: suppliedApproval }];
+  }
+  assert(rotations.length <= 128, 'LEDGER_INVALID');
+  const chain = [await readSnapshot(root, ledger.approvalSha256, now)];
+  for (const record of rotations) {
+    const binding = record.reservation;
+    assert(exactKeys(binding, ['generation', 'from', 'to']) && binding.generation === chain.length
+      && binding.from === chain.at(-1).hash && typeof binding.to === 'string' && HASH_RE.test(binding.to)
+      && !chain.some(item => item.hash === binding.to), 'LEDGER_INVALID');
+    const next = await readSnapshot(root, binding.to, now);
+    validateTransition(chain.at(-1).approval, next.approval);
+    chain.push(next);
+  }
+  return chain;
+}
+
+function validateLedger(ledger, approval, approvalHash, now, chain = [{ hash: approvalHash, approval }]) {
+  assert(exactKeys(ledger, ['schema', 'approvalId', 'approvalSha256', 'entries'])
+    && ledger.schema === LEDGER_SCHEMA && ledger.approvalId === chain[0]?.approval.approvalId
+    && ledger.approvalSha256 === chain[0]?.hash && Array.isArray(ledger.entries)
+    && ledger.entries.length <= 512, 'LEDGER_INVALID');
+  const usage = Object.fromEntries(Object.keys(LIMITS).map(key => [key, 0]));
+  const phaseMessages = Object.fromEntries(PHASES.map(phase => [phase, 0]));
+  const phaseReads = Object.fromEntries(PHASES.map(phase => [phase, 0]));
+  const reservations = new Map();
+  let previous = ZERO_HASH;
+  let lastTime = 0;
+  let generation = 0;
+  for (const [index, record] of ledger.entries.entries()) {
+    const keys = ['sequence', 'kind', 'phase', 'cost', 'reservation', 'status', 'at', 'previous', 'hash'];
+    const withResult = Object.hasOwn(record, 'resultSha256');
+    assert(exactKeys(record, withResult ? [...keys, 'resultSha256'] : keys)
+        && (!withResult || record.kind === 'result' && ['discovery', 'mutations', 'reconciliation'].includes(record.phase)
+          && HASH_RE.test(record.resultSha256 ?? ''))
+      && record.sequence === index + 1 && (record.kind === 'rotate' ? record.phase === null : PHASES.includes(record.phase))
+      && ['phase', 'effect', 'result', 'rotate'].includes(record.kind) && validBudget(record.cost)
+      && isoTime(record.at) !== null && isoTime(record.at) >= lastTime
+      && record.previous === previous && HASH_RE.test(record.hash) && record.hash === recordHash(record), 'LEDGER_INVALID');
+    lastTime = isoTime(record.at);
+    assert(lastTime <= now, 'LEDGER_INVALID');
+    if (record.kind === 'phase') {
+      assert(record.reservation === null && record.status === 'reserved'
+        && chain[generation]?.approval.phases[record.phase] === 1
+        && Object.values(record.cost).every(value => value === 0)
+        && ![...reservations.values()].some(item => item.phase === record.phase), 'LEDGER_INVALID');
+      reservations.set(record.sequence, { phase: record.phase, complete: false });
+    } else if (record.kind === 'effect') {
+      const phase = reservations.get(record.reservation);
+      assert(phase && !phase.complete && phase.phase === record.phase && record.status === 'reserved'
+        && Object.entries(record.cost).some(([, value]) => value > 0)
+        && Object.entries(record.cost).every(([key, value]) => value === 0 || PHASE_EFFECTS[record.phase].includes(key)), 'LEDGER_INVALID');
+      for (const key of Object.keys(usage)) {
+        usage[key] += record.cost[key];
+        assert(usage[key] <= chain[0].approval.limits[key], 'LEDGER_INVALID');
+      }
+      phaseMessages[record.phase] += record.cost.messages;
+      phaseReads[record.phase] += record.cost.reads;
+      assert(phaseMessages[record.phase] <= PHASE_MESSAGE_LIMITS[record.phase], 'LEDGER_INVALID');
+      if (chain[generation].approval.schema !== APPROVAL_SCHEMA) assert(phaseReads[record.phase] <= PHASE_READ_LIMITS[record.phase], 'LEDGER_INVALID');
+    } else if (record.kind === 'result') {
+      const phase = reservations.get(record.reservation);
+      assert(phase && !phase.complete && phase.phase === record.phase
+        && ['completed', 'failed', 'interrupted', 'interrupted_acknowledged'].includes(record.status)
+        && Object.values(record.cost).every(value => value === 0), 'LEDGER_INVALID');
+      if (['discovery', 'reconciliation'].includes(record.phase) && record.status === 'completed') assert(withResult, 'LEDGER_INVALID');
+      if (record.status === 'interrupted_acknowledged') assert(PHASE_EFFECTS[record.phase].every(effect => effect === 'reads'), 'LEDGER_INVALID');
+      phase.complete = true;
+    } else {
+      const binding = record.reservation;
+      assert(exactKeys(binding, ['generation', 'from', 'to']) && binding.generation === generation + 1
+        && binding.from === chain[generation]?.hash && binding.to === chain[generation + 1]?.hash
+        && record.status === 'rotated' && Object.values(record.cost).every(value => value === 0)
+        && ![...reservations.values()].some(item => !item.complete)
+        && (chain[generation].approval.schema !== APPROVAL_SCHEMA || chain[generation + 1].approval.schema !== DISCOVERY_SCHEMA
+          || ![...reservations.values()].some(item => ['mutations', 'discovery'].includes(item.phase)))
+        && [...reservations.values()].every(item => chain[generation + 1].approval.phases[item.phase] === 0), 'LEDGER_INVALID');
+      generation++;
+    }
+    previous = record.hash;
+  }
+  assert(generation === chain.length - 1 && chain[generation].hash === approvalHash, 'LEDGER_INVALID');
+  return { usage, phaseMessages, phaseReads, reservations };
+}
+
+async function validateMarkers(root, ledger) {
+  const names = (await fs.readdir(root)).filter(name => name.startsWith(MARKER_PREFIX)).sort();
+  const expected = ledger.entries.filter(record => record.kind !== 'result').map(markerName).sort();
+  assert(JSON.stringify(names) === JSON.stringify(expected), 'LEDGER_CHANGED');
+  for (const name of names) {
+    const file = await readPrivateFile(join(root, name), 'LEDGER_CHANGED', [0o600]);
+    const record = ledger.entries.find(item => item.kind !== 'result' && markerName(item) === name);
+    assert(record && file.bytes.toString('utf8') === markerContent(record), 'LEDGER_CHANGED');
+  }
+}
+
+async function syncDirectory(path) {
+  const handle = await fs.open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try { await handle.sync(); } finally { await handle.close(); }
+}
+
+async function takeLock(root) {
+  const path = join(root, LOCK_NAME);
+  let handle;
+  try {
+    handle = await fs.open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+  } catch (error) {
+    if (error.code === 'EEXIST') fail('BUSY');
+    fail('ROOT_UNSAFE');
+  }
+  const token = randomUUID();
+  const identity = await handle.stat({ bigint: true });
+  try {
+    await handle.writeFile(JSON.stringify({ pid: process.pid, token }));
+    await handle.sync();
+    await handle.close();
+  } catch {
+    await handle.close().catch(() => {});
+    const current = await fs.lstat(path, { bigint: true }).catch(() => null);
+    if (current && sameFile(current, identity)) await fs.unlink(path).catch(() => {});
+    fail('ROOT_UNSAFE');
+  }
+  const verify = async () => {
+    try {
+      const file = await readPrivateFile(path, 'LOCK_LOST', [0o600]);
+      const data = parseJson(file.bytes, 'LOCK_LOST');
+      assert(sameFile(file.stat, identity) && data.pid === process.pid && data.token === token, 'LOCK_LOST');
+    } catch {
+      fail('LOCK_LOST');
+    }
+  };
+  const release = async () => {
+    try {
+      const file = await readPrivateFile(path, 'ROOT_UNSAFE', [0o600]);
+      const data = parseJson(file.bytes, 'ROOT_UNSAFE');
+      if (sameFile(file.stat, identity) && data.pid === process.pid && data.token === token) {
+        await fs.unlink(path);
+        return true;
+      }
+    } catch {}
+    return false;
+  };
+  return { verify, release };
+}
+
+async function writeLedger(root, rootIdentity, lock, ledgerPath, previous, ledger) {
+  const bytes = Buffer.from(`${JSON.stringify(ledger)}\n`);
+  assert(bytes.length <= MAX_FILE_BYTES, 'LEDGER_INVALID');
+  await lock.verify();
+  assert(sameFile(await privateDirectory(root), rootIdentity), 'ROOT_UNSAFE');
+  const current = await readPrivateFile(ledgerPath, 'LEDGER_UNSAFE', [0o600]);
+  assert(sameFile(current.stat, previous.stat) && current.bytes.equals(previous.bytes), 'LEDGER_CHANGED');
+  const temporary = join(root, `.design-ledger-${randomUUID()}.tmp`);
+  let handle;
+  let identity;
+  try {
+    handle = await fs.open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    identity = await handle.stat({ bigint: true });
+    await handle.writeFile(bytes);
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    const finalCheck = await readPrivateFile(ledgerPath, 'LEDGER_UNSAFE', [0o600]);
+    assert(sameFile(finalCheck.stat, previous.stat) && finalCheck.bytes.equals(previous.bytes), 'LEDGER_CHANGED');
+    await lock.verify();
+    assert(sameFile(await privateDirectory(root), rootIdentity), 'ROOT_UNSAFE');
+    await fs.rename(temporary, ledgerPath);
+    await syncDirectory(root);
+    return await readPrivateFile(ledgerPath, 'LEDGER_UNSAFE', [0o600]);
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    if (identity) {
+      const remaining = await fs.lstat(temporary, { bigint: true }).catch(() => null);
+      if (remaining && sameFile(remaining, identity)) await fs.unlink(temporary).catch(() => {});
+    }
+    if (error instanceof BridgeError) throw error;
+    fail('LEDGER_UNSAFE');
+  }
+}
+
+function makeRecord(ledger, { kind, phase, cost, reservation = null, status, now }) {
+  const record = {
+    sequence: ledger.entries.length + 1, kind, phase, cost, reservation, status,
+    at: new Date(now).toISOString(), previous: ledger.entries.at(-1)?.hash ?? ZERO_HASH,
+  };
+  return { ...record, hash: recordHash(record) };
+}
+
+function makeResultRecord(ledger, options) {
+  const base = makeRecord(ledger, options);
+  if (!options.resultSha256) return base;
+  const record = { ...base, resultSha256: options.resultSha256 };
+  record.hash = recordHash(record);
+  return record;
+}
+
+async function addRecord(state, options) {
+  await state.lock.verify();
+  const root = await privateDirectory(state.root);
+  assert(sameFile(root, state.rootIdentity), 'ROOT_UNSAFE');
+  const record = makeResultRecord(state.ledger, options);
+  const ledger = { ...state.ledger, entries: [...state.ledger.entries, record] };
+  const chain = await approvalChain(state.root, ledger, state.approval, state.approvalHash, options.now);
+  assert(chain.at(-1).hash === state.approvalHash, 'APPROVAL_SUPERSEDED');
+  validateLedger(ledger, state.approval, state.approvalHash, options.now, chain);
+  if (record.kind !== 'result') {
+    const name = markerName(record);
+    const handle = await fs.open(join(state.root, name), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    try { await handle.writeFile(`${name}\n`); await handle.sync(); } finally { await handle.close(); }
+    await syncDirectory(state.root);
+  }
+  state.previous = await writeLedger(state.root, state.rootIdentity, state.lock, state.ledgerPath, state.previous, ledger);
+  state.ledger = ledger;
+  return record;
+}
+
+function emptyCost() {
+  return Object.fromEntries(Object.keys(LIMITS).map(key => [key, 0]));
+}
+
+async function ensureSnapshotDirectory(root) {
+  const directory = join(root, SNAPSHOT_DIR);
+  try {
+    await fs.mkdir(directory, { mode: 0o700 });
+    await syncDirectory(root);
+  } catch (error) {
+    if (error.code !== 'EEXIST') fail('ROOT_UNSAFE');
+  }
+  return snapshotDirectory(root);
+}
+
+async function settlePublished(path, bytes, mode) {
+  const file = await readPrivateFile(path, 'ROTATION_CONFLICT', [mode], [1n, 2n]);
+  assert(file.bytes.equals(bytes), 'ROTATION_CONFLICT');
+  if (file.stat.nlink === 2n) {
+    const directory = dirname(path);
+    const names = (await fs.readdir(directory)).filter(name => /^\.design-stage-[0-9a-f-]{36}$/.test(name));
+    assert(names.length <= 128, 'ROTATION_CONFLICT');
+    const candidates = [];
+    for (const name of names) {
+      const candidate = join(directory, name);
+      const stat = await fs.lstat(candidate, { bigint: true });
+      if (!stat.isSymbolicLink() && sameFile(stat, file.stat) && privateFile(stat, [mode], [2n])) candidates.push(candidate);
+    }
+    assert(candidates.length === 1, 'ROTATION_CONFLICT');
+    const current = await fs.lstat(path, { bigint: true });
+    const staging = await fs.lstat(candidates[0], { bigint: true });
+    assert(sameFile(current, file.stat) && sameFile(staging, file.stat) && current.nlink === 2n && staging.nlink === 2n, 'ROTATION_CONFLICT');
+    await fs.unlink(candidates[0]);
+    await syncDirectory(directory);
+  }
+  const settled = await readPrivateFile(path, 'ROTATION_CONFLICT', [mode]);
+  assert(settled.bytes.equals(bytes), 'ROTATION_CONFLICT');
+}
+
+async function publishPrivate(path, bytes, mode, afterStage, afterLink) {
+  const directory = dirname(path);
+  const staging = join(directory, `.design-stage-${randomUUID()}`);
+  const handle = await fs.open(staging, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, mode);
+  const identity = await handle.stat({ bigint: true });
+  let linked = false;
+  try {
+    await handle.writeFile(bytes);
+    await handle.sync();
+    await handle.close();
+    await afterStage();
+    try {
+      await fs.link(staging, path);
+      linked = true;
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      const own = await fs.lstat(staging, { bigint: true });
+      assert(sameFile(own, identity), 'ROTATION_CONFLICT');
+      await fs.unlink(staging);
+      await settlePublished(path, bytes, mode);
+      return;
+    }
+    await syncDirectory(directory);
+    await afterLink();
+    await settlePublished(path, bytes, mode);
+  } catch (error) {
+    await handle.close().catch(() => {});
+    if (!linked) {
+      const own = await fs.lstat(staging, { bigint: true }).catch(() => null);
+      if (own && sameFile(own, identity)) await fs.unlink(staging).catch(() => {});
+    }
+    throw error;
+  }
+}
+
+async function writeSnapshot(root, bytes, hash, now, afterStep) {
+  assert(digest(bytes) === hash, 'ROTATION_CONFLICT');
+  const directory = await ensureSnapshotDirectory(root);
+  const path = join(directory, `${hash}.json`);
+  const existing = await fs.lstat(path).catch(error => error.code === 'ENOENT' ? null : Promise.reject(error));
+  if (existing) await settlePublished(path, bytes, 0o400);
+  else await publishPrivate(path, bytes, 0o400, () => afterStep('snapshot-staged'), () => afterStep('snapshot-link'));
+  const snapshot = await readSnapshot(root, hash, now);
+  assert(snapshot.hash === hash, 'ROTATION_CONFLICT');
+}
+
+function safeApprovalLocation(path, root) {
+  const name = relative(root, path);
+  assert(![LEDGER_NAME, LOCK_NAME].includes(name) && !name.startsWith(MARKER_PREFIX)
+    && !inside(path, join(root, SNAPSHOT_DIR)), 'APPROVAL_UNSAFE');
+}
+
+export async function rotateProbeApproval(options, { getScope = currentScope, getCodeHashes = computeCodeHashes,
+  now = Date.now, signal, afterStep = async () => {} } = {}) {
+  assert(options && typeof options === 'object' && typeof options.approvalFile === 'string'
+    && typeof options.nextApprovalFile === 'string' && options.approvalFile !== options.nextApprovalFile
+    && typeof afterStep === 'function', 'INVALID_ARGUMENT');
+  checkAbort(signal);
+  const current = await readApproval(options.approvalFile, now(), { historical: true });
+  const next = await readApproval(options.nextApprovalFile, now());
+  assert(current.hash !== next.hash, 'ROTATION_CONFLICT');
+  validateTransition(current.approval, next.approval);
+  const root = current.approval.evidenceRoot;
+  const rootIdentity = await privateDirectory(root);
+  safeApprovalLocation(options.approvalFile, root);
+  safeApprovalLocation(options.nextApprovalFile, root);
+  matchScope(next.approval.taskPack, await getScope());
+  await matchCode(next.approval.codeHashes, getCodeHashes);
+  const lock = await takeLock(root);
+  let result;
+  let failure;
+  try {
+    const ledgerPath = join(root, LEDGER_NAME);
+    const previous = await readPrivateFile(ledgerPath, 'LEDGER_UNSAFE', [0o600]);
+    const ledger = parseJson(previous.bytes, 'LEDGER_INVALID');
+    const chain = await approvalChain(root, ledger, current.approval, current.hash, now());
+    const active = chain.at(-1);
+    const checked = validateLedger(ledger, active.approval, active.hash, now(), chain);
+    const last = ledger.entries.at(-1);
+    if (active.hash === next.hash && last?.kind === 'rotate'
+      && last.reservation.from === current.hash && last.reservation.to === next.hash) {
+      await validateMarkers(root, ledger);
+      if (current.approval.schema === DISCOVERY_SCHEMA && next.approval.schema === RECONCILIATION_SCHEMA) {
+        await readReconciliationBinding(root, next.approval.reconciliationTarget);
+      }
+      result = { ok: true, generation: last.reservation.generation, alreadyRotated: true, usage: checked.usage };
+    } else {
+      assert(active.hash === current.hash, 'APPROVAL_SUPERSEDED');
+      assert(![...checked.reservations.values()].some(item => !item.complete)
+        && [...checked.reservations.values()].every(item => next.approval.phases[item.phase] === 0)
+        && (current.approval.schema !== APPROVAL_SCHEMA || next.approval.schema !== DISCOVERY_SCHEMA
+          || ![...checked.reservations.values()].some(item => ['mutations', 'discovery'].includes(item.phase))), 'ROTATION_CONFLICT');
+      if (current.approval.schema === DISCOVERY_SCHEMA && next.approval.schema === RECONCILIATION_SCHEMA) {
+        assert(ledger.entries.some(record => record.kind === 'result' && record.phase === 'mutations' && record.status === 'failed')
+          && ![...checked.reservations.values()].some(item => item.phase === 'versioned-files' || item.phase === 'reconciliation'), 'ROTATION_CONFLICT');
+        await readReconciliationBinding(root, next.approval.reconciliationTarget);
+      }
+      const generation = chain.length;
+      assert(generation <= 128, 'ROTATION_CONFLICT');
+      const binding = { generation, from: current.hash, to: next.hash };
+      const marker = join(root, markerName({ kind: 'rotate', reservation: binding }));
+      const currentBytes = (await readPrivateFile(options.approvalFile, 'APPROVAL_UNSAFE')).bytes;
+      const nextBytes = (await readPrivateFile(options.nextApprovalFile, 'APPROVAL_UNSAFE')).bytes;
+      assert(digest(currentBytes) === current.hash && digest(nextBytes) === next.hash, 'APPROVAL_CHANGED');
+      const existing = await fs.lstat(marker).catch(error => error.code === 'ENOENT' ? null : Promise.reject(error));
+      let record;
+      if (existing) {
+        const file = await readPrivateFile(marker, 'LEDGER_CHANGED', [0o600], [1n, 2n]);
+        record = parseJson(file.bytes, 'LEDGER_INVALID');
+        const time = isoTime(record.at);
+        assert(time !== null && time <= now(), 'ROTATION_CONFLICT');
+        const expected = makeRecord(ledger, { kind: 'rotate', phase: null, cost: emptyCost(), reservation: binding,
+          status: 'rotated', now: time });
+        assert(file.bytes.toString('utf8') === markerContent(expected), 'ROTATION_CONFLICT');
+        await settlePublished(join(root, SNAPSHOT_DIR, `${current.hash}.json`), currentBytes, 0o400);
+        await settlePublished(join(root, SNAPSHOT_DIR, `${next.hash}.json`), nextBytes, 0o400);
+        await readSnapshot(root, current.hash, now());
+        await readSnapshot(root, next.hash, now());
+        await settlePublished(marker, Buffer.from(markerContent(expected)), 0o600);
+      } else {
+        await validateMarkers(root, ledger);
+        await writeSnapshot(root, currentBytes, current.hash, now(), afterStep);
+        await writeSnapshot(root, nextBytes, next.hash, now(), afterStep);
+        await afterStep('snapshots');
+        checkAbort(signal);
+        await lock.verify();
+        assert(sameFile(await privateDirectory(root), rootIdentity), 'ROOT_UNSAFE');
+        record = makeRecord(ledger, { kind: 'rotate', phase: null, cost: emptyCost(), reservation: binding,
+          status: 'rotated', now: now() });
+        await publishPrivate(marker, Buffer.from(markerContent(record)), 0o600,
+          () => afterStep('marker-staged'), () => afterStep('marker-link'));
+        await afterStep('marker');
+      }
+      checkAbort(signal);
+      const updated = { ...ledger, entries: [...ledger.entries, record] };
+      const nextChain = await approvalChain(root, updated, next.approval, next.hash, now());
+      validateLedger(updated, next.approval, next.hash, now(), nextChain);
+      await validateMarkers(root, updated);
+      assert((await readApproval(options.approvalFile, now(), { historical: true })).hash === current.hash
+        && (await readApproval(options.nextApprovalFile, now())).hash === next.hash, 'APPROVAL_CHANGED');
+      matchScope(next.approval.taskPack, await getScope());
+      await matchCode(next.approval.codeHashes, getCodeHashes);
+      if (current.approval.schema === DISCOVERY_SCHEMA && next.approval.schema === RECONCILIATION_SCHEMA) {
+        await readReconciliationBinding(root, next.approval.reconciliationTarget);
+      }
+      await lock.verify();
+      checkAbort(signal);
+      await writeLedger(root, rootIdentity, lock, ledgerPath, previous, updated);
+      await afterStep('ledger');
+      result = { ok: true, generation, alreadyRotated: false, usage: checked.usage };
+    }
+  } catch (error) {
+    failure = safeFailure(error);
+  } finally {
+    if (!(await lock.release())) failure = new BridgeError('LOCK_LOST', MESSAGES.LOCK_LOST, failure?.details ?? {});
+  }
+  if (failure) throw failure;
+  return result;
+}
+
+export async function inspectProbeApproval(options, { getScope = currentScope, getCodeHashes = computeCodeHashes,
+  now = Date.now, signal } = {}) {
+  assert(options && typeof options.approvalFile === 'string'
+    && (options.historyOnly === undefined || typeof options.historyOnly === 'boolean'), 'INVALID_ARGUMENT');
+  checkAbort(signal);
+  const first = await readApproval(options.approvalFile, now(), { historical: true });
+  const root = first.approval.evidenceRoot;
+  const rootIdentity = await privateDirectory(root);
+  safeApprovalLocation(options.approvalFile, root);
+  const lock = await takeLock(root);
+  let result;
+  let failure;
+  try {
+    const ledger = parseJson((await readPrivateFile(join(root, LEDGER_NAME), 'LEDGER_UNSAFE', [0o600])).bytes, 'LEDGER_INVALID');
+    const chain = await approvalChain(root, ledger, first.approval, first.hash, now());
+    assert(chain.at(-1).hash === first.hash, 'APPROVAL_SUPERSEDED');
+    validateApproval(first.approval, now(), { historical: options.historyOnly === true });
+    const checked = validateLedger(ledger, first.approval, first.hash, now(), chain);
+    await validateMarkers(root, ledger);
+    let scopeMatch;
+    let codeMatch;
+    if (options.historyOnly === true) {
+      scopeMatch = scopeMatches(first.approval.taskPack, await getScope());
+      const actual = await getCodeHashes();
+      assert(exactKeys(actual, CODE_FILES) && CODE_FILES.every(path => HASH_RE.test(actual[path] ?? '')), 'CODE_CHANGED');
+      codeMatch = exactKeys(first.approval.codeHashes, CODE_FILES)
+        && CODE_FILES.every(path => first.approval.codeHashes[path] === actual[path]);
+    } else {
+      matchScope(first.approval.taskPack, await getScope());
+      await matchCode(first.approval.codeHashes, getCodeHashes);
+    }
+    assert((await readApproval(options.approvalFile, now(), { historical: options.historyOnly === true })).hash === first.hash, 'APPROVAL_CHANGED');
+    assert(sameFile(await privateDirectory(root), rootIdentity), 'ROOT_UNSAFE');
+    const ledgerAfter = parseJson((await readPrivateFile(join(root, LEDGER_NAME), 'LEDGER_UNSAFE', [0o600])).bytes, 'LEDGER_INVALID');
+    assert(JSON.stringify(ledgerAfter) === JSON.stringify(ledger), 'LEDGER_CHANGED');
+    const finalChain = await approvalChain(root, ledgerAfter, first.approval, first.hash, now());
+    assert(finalChain.at(-1).hash === first.hash, 'APPROVAL_SUPERSEDED');
+    validateLedger(ledgerAfter, first.approval, first.hash, now(), finalChain);
+    await validateMarkers(root, ledgerAfter);
+    await lock.verify();
+    checkAbort(signal);
+    result = { ok: true, generation: chain.length - 1, usage: checked.usage,
+      remaining: Object.fromEntries(Object.keys(LIMITS).map(key => [key, first.approval.limits[key] - checked.usage[key]])),
+      phases: { ...first.approval.phases } };
+    if (options.historyOnly === true) {
+      result = { ...result, mode: 'history-only', executable: false, scopeMatch, codeMatch };
+    }
+  } catch (error) {
+    failure = safeFailure(error);
+  } finally {
+    if (!(await lock.release())) failure = new BridgeError('LOCK_LOST', MESSAGES.LOCK_LOST);
+  }
+  if (failure) throw failure;
+  return result;
+}
+
+export async function closeInterruptedProbe(options, { now = Date.now, signal } = {}) {
+  assert(options && typeof options.approvalFile === 'string' && options.phase === 'discovery', 'INVALID_ARGUMENT');
+  checkAbort(signal);
+  const first = await readApproval(options.approvalFile, now(), { historical: true });
+  const root = first.approval.evidenceRoot;
+  const rootIdentity = await privateDirectory(root);
+  safeApprovalLocation(options.approvalFile, root);
+  const lock = await takeLock(root);
+  let result;
+  let failure;
+  try {
+    const ledgerPath = join(root, LEDGER_NAME);
+    const previous = await readPrivateFile(ledgerPath, 'LEDGER_UNSAFE', [0o600]);
+    const ledger = parseJson(previous.bytes, 'LEDGER_INVALID');
+    const chain = await approvalChain(root, ledger, first.approval, first.hash, now());
+    assert(chain.at(-1).hash === first.hash, 'APPROVAL_SUPERSEDED');
+    const checked = validateLedger(ledger, first.approval, first.hash, now(), chain);
+    await validateMarkers(root, ledger);
+    const phase = [...checked.reservations.entries()].filter(([, item]) => !item.complete);
+    assert(phase.length === 1 && phase[0][1].phase === 'discovery'
+      && ledger.entries.filter(record => record.kind === 'effect' && record.reservation === phase[0][0])
+        .every(record => Object.entries(record.cost).every(([key, value]) => key === 'reads' || value === 0)), 'PHASE_UNRESOLVED');
+    const state = { root, rootIdentity, lock, ledgerPath, ledger, previous, approval: first.approval, approvalHash: first.hash };
+    checkAbort(signal);
+    await addRecord(state, { kind: 'result', phase: 'discovery', cost: emptyCost(), reservation: phase[0][0],
+      status: 'interrupted_acknowledged', now: now() });
+    result = { ok: true, phase: 'discovery', status: 'interrupted_acknowledged', usage: checked.usage };
+  } catch (error) {
+    failure = safeFailure(error);
+  } finally {
+    if (!(await lock.release())) failure = new BridgeError('LOCK_LOST', MESSAGES.LOCK_LOST);
+  }
+  if (failure) throw failure;
+  return result;
+}
+
+export async function runProbe(options, { runners = {}, getScope = currentScope, getCodeHashes = computeCodeHashes, now = Date.now, signal } = {}) {
+  assert(options && typeof options === 'object' && typeof options.live === 'boolean', 'INVALID_ARGUMENT');
+  if (options.phase !== undefined) assert(PHASES.includes(options.phase), 'INVALID_ARGUMENT');
+  if (!options.live) return { ok: true, skipped: true, reason: 'Pass --live and an operator-approved file; nothing was accessed' };
+  assert(PHASES.includes(options.phase) && typeof options.approvalFile === 'string'
+    && isAbsolute(options.approvalFile) && resolve(options.approvalFile) === options.approvalFile, 'INVALID_ARGUMENT');
+  assert(Object.hasOwn(runners, options.phase) && typeof runners[options.phase] === 'function', 'PHASE_UNAVAILABLE');
+  checkAbort(signal);
+  const first = await readApproval(options.approvalFile, now(), { historical: true });
+  const { approval } = first;
+  const root = approval.evidenceRoot;
+  assert(approval.phases[options.phase] === 1, 'APPROVAL_INVALID');
+  const rootIdentity = await privateDirectory(root);
+  safeApprovalLocation(options.approvalFile, root);
+  checkAbort(signal);
+  const lock = await takeLock(root);
+  let phaseRecord = null;
+  let state;
+  let result;
+  let failure;
+  let pendingEffect = null;
+  let phaseClosed = false;
+  let resultSha256;
+  try {
+    const ledgerPath = join(root, LEDGER_NAME);
+    const previous = await readPrivateFile(ledgerPath, 'LEDGER_UNSAFE', [0o600]);
+    const ledger = parseJson(previous.bytes, 'LEDGER_INVALID');
+    if (Array.isArray(ledger.entries) && !ledger.entries.some(record => record?.kind === 'rotate')) validateApproval(approval, now());
+    const chain = await approvalChain(root, ledger, approval, first.hash, now());
+    assert(chain.at(-1).hash === first.hash, 'APPROVAL_SUPERSEDED');
+    validateApproval(approval, now());
+    const initial = validateLedger(ledger, approval, first.hash, now(), chain);
+    await validateMarkers(root, ledger);
+    if (approval.schema === DISCOVERY_SCHEMA && options.phase === 'mutations') {
+      const discovery = ledger.entries.find(record => record.kind === 'result' && record.phase === 'discovery'
+        && record.status === 'completed' && HASH_RE.test(record.resultSha256 ?? ''));
+      assert(discovery, 'PHASE_UNRESOLVED');
+      const evidence = await readPrivateFile(join(root, 'discovery-result.json'), 'LEDGER_CHANGED', [0o600]);
+      assert(digest(evidence.bytes) === discovery.resultSha256, 'LEDGER_CHANGED');
+      const report = parseJson(evidence.bytes, 'LEDGER_CHANGED');
+      if (report.typeEvidence === 'unknown' && !MUTATION_PROMPT_ONLY_ACCEPTED) fail('DESIGN_PROTOCOL_UNVERIFIED');
+    }
+    if (options.phase === 'reconciliation') await readReconciliationBinding(root, approval.reconciliationTarget);
+    assert(![...initial.reservations.values()].some(item => !item.complete || item.phase === options.phase), 'PHASE_UNRESOLVED');
+    matchScope(approval.taskPack, await getScope());
+    await matchCode(approval.codeHashes, getCodeHashes);
+    const refreshed = await readApproval(options.approvalFile, now());
+    assert(refreshed.hash === first.hash, 'APPROVAL_CHANGED');
+    matchScope(approval.taskPack, await getScope());
+    await matchCode(approval.codeHashes, getCodeHashes);
+    checkAbort(signal);
+    state = { root, rootIdentity, lock, ledgerPath, ledger, previous, approval, approvalHash: first.hash };
+    phaseRecord = await addRecord(state, { kind: 'phase', phase: options.phase, cost: emptyCost(), status: 'reserved', now: now() });
+    let effects = 0;
+    const perform = (cost, action) => {
+      if (pendingEffect || phaseClosed) return Promise.reject(new BridgeError('BUSY', MESSAGES.BUSY));
+      const operation = (async () => {
+        checkAbort(signal);
+        assert(validBudget(cost) && typeof action === 'function'
+          && Object.entries(cost).some(([, value]) => value > 0)
+          && Object.entries(cost).every(([key, value]) => value === 0 || PHASE_EFFECTS[options.phase].includes(key)), 'LIVE_GUARD');
+        const pinnedCost = Object.freeze({ ...cost });
+        await lock.verify();
+        const currentApproval = await readApproval(options.approvalFile, now());
+        assert(currentApproval.hash === first.hash, 'APPROVAL_CHANGED');
+        matchScope(approval.taskPack, await getScope());
+        await matchCode(approval.codeHashes, getCodeHashes);
+        const currentChain = await approvalChain(root, state.ledger, approval, first.hash, now());
+        assert(currentChain.at(-1).hash === first.hash, 'APPROVAL_SUPERSEDED');
+        const checked = validateLedger(state.ledger, approval, first.hash, now(), currentChain);
+        for (const key of Object.keys(LIMITS)) assert(checked.usage[key] + pinnedCost[key] <= approval.limits[key], 'BUDGET_EXHAUSTED');
+        assert(checked.phaseMessages[options.phase] + pinnedCost.messages <= PHASE_MESSAGE_LIMITS[options.phase], 'BUDGET_EXHAUSTED');
+        if (approval.schema !== APPROVAL_SCHEMA) assert(checked.phaseReads[options.phase] + pinnedCost.reads <= PHASE_READ_LIMITS[options.phase], 'BUDGET_EXHAUSTED');
+        await validateMarkers(root, state.ledger);
+        await addRecord(state, { kind: 'effect', phase: options.phase, cost: pinnedCost, reservation: phaseRecord.sequence, status: 'reserved', now: now() });
+        const beforeEffect = await readApproval(options.approvalFile, now());
+        assert(beforeEffect.hash === first.hash, 'APPROVAL_CHANGED');
+        matchScope(approval.taskPack, await getScope());
+        await matchCode(approval.codeHashes, getCodeHashes);
+        if (options.phase === 'reconciliation') await readReconciliationBinding(root, approval.reconciliationTarget);
+        await lock.verify();
+        assert(sameFile(await privateDirectory(root), rootIdentity), 'ROOT_UNSAFE');
+        checkAbort(signal);
+        assert(!phaseClosed, 'ABORTED');
+        effects++;
+        return await action();
+      })();
+      pendingEffect = operation;
+      void operation.finally(() => { if (pendingEffect === operation) pendingEffect = null; }).catch(() => {});
+      return operation;
+    };
+    const sourceTarget = options.phase === 'source' ? Object.freeze({ ...approval.sourceTarget }) : undefined;
+    const reconciliationTarget = options.phase === 'reconciliation' ? Object.freeze({ ...approval.reconciliationTarget }) : undefined;
+    const phaseResult = await runners[options.phase]({ perform, signal, sourceTarget, reconciliationTarget, root });
+    assert(pendingEffect === null, 'PROBE_FAILED');
+    checkAbort(signal);
+    assert(effects > 0, 'PROBE_FAILED');
+    result = { ok: true, phase: options.phase };
+    if (options.phase === 'discovery') {
+      assert(exactKeys(phaseResult, ['kind', 'designControl', 'designSystemControl', 'draftEmpty', 'hidden', 'targetRetained', 'typeEvidence', 'routes', 'truncated'])
+        && phaseResult.kind === 'discovery-evidence' && typeof phaseResult.designControl === 'boolean'
+        && typeof phaseResult.designSystemControl === 'boolean' && phaseResult.draftEmpty === true && phaseResult.hidden === true
+        && phaseResult.targetRetained === true && phaseResult.typeEvidence === 'unknown' && validDiscoveryRoutes(phaseResult.routes)
+        && typeof phaseResult.truncated === 'boolean', 'PROBE_FAILED');
+      const bytes = Buffer.from(`${JSON.stringify(phaseResult)}\n`);
+      resultSha256 = digest(bytes);
+      await publishPrivate(join(root, 'discovery-result.json'), bytes, 0o600, async () => {}, async () => {});
+      result.evidence = { ...phaseResult, resultSha256 };
+    }
+    if (options.phase === 'mutations' && phaseResult?.kind === 'mutation-evidence') {
+      const toolName = /^[A-Za-z0-9_.:-]{1,160}$/;
+      const artifactShape = value => value === null || exactKeys(value, ['frameIdSha256', 'shortIdSha256', 'version',
+        'sequence', 'fileCount', 'metadataCaptured', 'manifestVerified', 'sourceClaimsMatch', 'sourceClaimsMatchedCount'])
+        && HASH_RE.test(value.frameIdSha256) && HASH_RE.test(value.shortIdSha256)
+        && typeof value.version === 'string' && /^[A-Za-z0-9._-]{1,128}$/.test(value.version)
+        && Number.isSafeInteger(value.sequence) && value.sequence >= 1
+        && Number.isSafeInteger(value.fileCount) && value.fileCount >= 1 && value.fileCount <= 32
+        && typeof value.metadataCaptured === 'boolean' && typeof value.manifestVerified === 'boolean'
+        && value.sourceClaimsMatch === null
+        && (value.sourceClaimsMatchedCount === null || Number.isSafeInteger(value.sourceClaimsMatchedCount)
+          && value.sourceClaimsMatchedCount >= 0 && value.sourceClaimsMatchedCount <= value.fileCount);
+      assert(exactKeys(phaseResult, ['kind', 'outcome', 'conversationCreated', 'messageSent', 'turnComplete',
+        'toolNames', 'artifact', 'revisionStarted', 'targetRetained', 'stateSaved'])
+        && phaseResult.kind === 'mutation-evidence'
+        && ['no_artifact', 'unverified_turn', 'ambiguous_publications', 'publication_unclassified'].includes(phaseResult.outcome)
+        && phaseResult.conversationCreated === true && phaseResult.messageSent === true
+        && (phaseResult.turnComplete === null || typeof phaseResult.turnComplete === 'boolean')
+        && Array.isArray(phaseResult.toolNames) && phaseResult.toolNames.length <= 8
+        && phaseResult.toolNames.every(name => typeof name === 'string' && toolName.test(name))
+        && artifactShape(phaseResult.artifact) && phaseResult.revisionStarted === false
+        && phaseResult.targetRetained === true && typeof phaseResult.stateSaved === 'boolean', 'PROBE_FAILED');
+      const bytes = Buffer.from(`${JSON.stringify(phaseResult)}\n`);
+      resultSha256 = digest(bytes);
+      await publishPrivate(join(root, 'mutation-result.json'), bytes, 0o600, async () => {}, async () => {});
+      result.evidence = { ...phaseResult, resultSha256 };
+    }
+    if (options.phase === 'reconciliation') {
+      assert(exactKeys(phaseResult, ['kind', 'status', 'reason', 'stopReason', 'associated', 'humanCount', 'assistantCount',
+        'publicationCandidates', 'toolNames', 'organizationSha256', 'conversationSha256', 'humanSha256', 'assistantSha256',
+        'revisionStarted', 'targetRetained']) && phaseResult.kind === 'reconciliation-evidence'
+        && ['confirmed_complete', 'confirmed_truncated', 'in_progress_or_nonterminal', 'human_absent', 'ambiguous',
+          'conversation_not_found', 'unknown'].includes(phaseResult.status)
+        && (phaseResult.reason === null || ['invalid_history', 'network_unverified', 'too_large', 'content_type', 'http_or_request'].includes(phaseResult.reason))
+        && (phaseResult.stopReason === null || ['end_turn', 'stop_sequence', 'refusal', 'max_tokens', 'model_context_window_exceeded', 'tool_use', 'other'].includes(phaseResult.stopReason))
+        && typeof phaseResult.associated === 'boolean'
+        && [phaseResult.humanCount, phaseResult.assistantCount].every(count => Number.isSafeInteger(count) && count >= 0 && count <= 2048)
+        && (phaseResult.publicationCandidates === null || Number.isSafeInteger(phaseResult.publicationCandidates)
+          && phaseResult.publicationCandidates >= 1 && phaseResult.publicationCandidates <= 256)
+        && Array.isArray(phaseResult.toolNames) && phaseResult.toolNames.length <= 4
+        && phaseResult.toolNames.every(name => ['Write', 'Read', 'mcp__claude-artifacts__publish_files', 'other'].includes(name))
+        && [phaseResult.organizationSha256, phaseResult.conversationSha256].every(value => HASH_RE.test(value))
+        && phaseResult.organizationSha256 === digest(approval.reconciliationTarget.organizationId)
+        && phaseResult.conversationSha256 === digest(approval.reconciliationTarget.conversationId)
+        && [phaseResult.humanSha256, phaseResult.assistantSha256].every(value => value === null || HASH_RE.test(value))
+        && phaseResult.associated === ['confirmed_complete', 'confirmed_truncated'].includes(phaseResult.status)
+        && phaseResult.revisionStarted === false && phaseResult.targetRetained === true, 'PROBE_FAILED');
+      await readReconciliationBinding(root, approval.reconciliationTarget);
+      const bytes = Buffer.from(`${JSON.stringify(phaseResult)}\n`);
+      resultSha256 = digest(bytes);
+      await publishPrivate(join(root, 'reconciliation-result.json'), bytes, 0o600, async () => {}, async () => {});
+      result.evidence = { ...phaseResult, resultSha256 };
+    }
+    if (options.phase === 'source' && phaseResult?.kind === 'source-evidence') {
+      assert(exactKeys(phaseResult, ['kind', 'size', 'sha256', 'metadataMatched', 'sourceObserved', 'targetRetained'])
+        && phaseResult.size === approval.sourceTarget.size && phaseResult.sha256 === approval.sourceTarget.sha256
+        && phaseResult.metadataMatched === true && phaseResult.sourceObserved === true
+        && typeof phaseResult.targetRetained === 'boolean', 'PROBE_FAILED');
+      result.evidence = { size: phaseResult.size, sha256: phaseResult.sha256, metadataMatched: true,
+        sourceObserved: true, targetRetained: phaseResult.targetRetained };
+    }
+  } catch (error) {
+    failure = safeFailure(error);
+  } finally {
+    phaseClosed = true;
+    if (pendingEffect) await pendingEffect.catch(error => { failure ??= safeFailure(error); });
+    if (phaseRecord && state) {
+      try {
+        await addRecord(state, { kind: 'result', phase: options.phase, cost: emptyCost(), reservation: phaseRecord.sequence,
+          status: signal?.aborted ? 'interrupted' : failure ? 'failed' : 'completed', now: now(),
+          ...(resultSha256 ? { resultSha256 } : {}) });
+      } catch (error) {
+        const prior = failure?.details ?? {};
+        failure = safeFailure(error);
+        failure.details = { ...prior, ...failure.details };
+      }
+    }
+    if (!(await lock.release())) failure = new BridgeError('LOCK_LOST', MESSAGES.LOCK_LOST, failure?.details ?? {});
+  }
+  if (failure) throw failure;
+  return result;
+}
+
+export async function main(argv = process.argv.slice(2)) {
+  let values;
+  try {
+    const parsed = parseArgs({ args: argv, strict: true, allowPositionals: false, tokens: true,
+      options: { live: { type: 'boolean' }, rotate: { type: 'boolean' }, audit: { type: 'boolean' }, 'history-only': { type: 'boolean' }, 'close-interrupted': { type: 'boolean' },
+        help: { type: 'boolean' }, phase: { type: 'string' },
+        'approval-file': { type: 'string' }, 'next-approval-file': { type: 'string' } } });
+    const names = parsed.tokens.map(token => token.name);
+    assert(new Set(names).size === names.length, 'INVALID_ARGUMENT');
+    values = parsed.values;
+  } catch {
+    fail('INVALID_ARGUMENT');
+  }
+  if (values.help === true) {
+    assert(Object.keys(values).length === 1, 'INVALID_ARGUMENT');
+    return { ok: true, help: {
+      usage: 'node scripts/smoke-design.mjs --live --phase PHASE --approval-file ABSOLUTE_FILE',
+      rotation: 'node scripts/smoke-design.mjs --rotate --approval-file CURRENT --next-approval-file NEXT',
+      audit: 'node scripts/smoke-design.mjs --audit [--history-only] --approval-file CURRENT',
+      phases: PHASES,
+      status: SOURCE_LIVE_READY ? 'Passive source, read-only discovery and one-shot mutation probes are available behind explicit approvals; versioned and acceptance phases remain unavailable'
+        : 'No live phase is enabled; the passive source probe is pending review',
+      approval: {
+        schema: APPROVAL_SCHEMA, approvalId: 'operator-chosen 8-64 character alphanumeric/underscore/hyphen identifier',
+        issuer: 'host-under-user-authorization', scopeSummary: APPROVAL_SUMMARY,
+        taskPack: { branch: 'current integration branch', commit: 'current HEAD SHA-1', specSha256: 'SHA-256 of spec.md bytes' },
+        codeHashes: Object.fromEntries(CODE_FILES.map(path => [path, 'SHA-256 of exact implementation file bytes'])),
+        evidenceRoot: 'canonical existing private directory outside the repository',
+        sourceTarget: { organizationId: 'approved organization UUID', frameId: 'approved frame UUID', shortId: 'approved short ID',
+          version: 'approved version', size: 'approved byte count', sha256: 'approved SHA-256' },
+        phases: Object.fromEntries(PHASES.map(phase => [phase, 'operator-approved 0 or 1'])),
+        limits: LIMITS, notBefore: 'canonical ISO-8601 time', expiresAt: 'canonical ISO-8601 time',
+      },
+      ledger: { schema: LEDGER_SCHEMA, approvalId: 'same as approval', approvalSha256: 'SHA-256 of exact approval file bytes', entries: [] },
+      instructions: [
+        'The operator creates the approval file and the initial ledger.json explicitly; the probe never creates either one.',
+        'The approval must be an owned regular 0400 or 0600 file; ledger.json must be 0600, without links; the evidence directory must be 0700.',
+        'The limits above are hard maxima; the operator must select the explicitly approved limits and phases.',
+        'sessions counts new Claude conversations, not the owned CDP target; source cannot create conversations or send messages.',
+        'Never delete, recreate or roll back a ledger or reservation marker to regain budget; a fresh approval is a separate operator decision.',
+      ],
+    } };
+  }
+  if (values['history-only'] === true) assert(values.audit === true, 'INVALID_ARGUMENT');
+  if (values.live === true || values.rotate === true || values.audit === true || values['close-interrupted'] === true) {
+    const unsafe = Object.entries(process.env).some(([name, value]) => value &&
+      (['DEBUG', 'NODE_DEBUG', 'NODE_DEBUG_NATIVE', 'NODE_OPTIONS'].includes(name) || /^CCW_.*DEBUG/i.test(name)));
+    assert(!unsafe, 'LIVE_GUARD');
+  }
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  process.once('SIGINT', abort);
+  process.once('SIGTERM', abort);
+  try {
+    if (values['close-interrupted'] === true) {
+      assert(values.live === undefined && values.rotate === undefined && values.audit === undefined
+        && values['next-approval-file'] === undefined && values.phase === 'discovery'
+        && typeof values['approval-file'] === 'string', 'INVALID_ARGUMENT');
+      return await closeInterruptedProbe({ approvalFile: values['approval-file'], phase: values.phase }, { signal: controller.signal });
+    }
+    if (values.audit === true) {
+      assert(values.live === undefined && values.rotate === undefined && values.phase === undefined
+        && values['next-approval-file'] === undefined && typeof values['approval-file'] === 'string', 'INVALID_ARGUMENT');
+      return await inspectProbeApproval({ approvalFile: values['approval-file'], historyOnly: values['history-only'] === true }, { signal: controller.signal });
+    }
+    if (values.rotate === true) {
+      assert(values.live === undefined && values.phase === undefined && typeof values['approval-file'] === 'string'
+        && typeof values['next-approval-file'] === 'string', 'INVALID_ARGUMENT');
+      return await rotateProbeApproval({ approvalFile: values['approval-file'], nextApprovalFile: values['next-approval-file'] },
+        { signal: controller.signal });
+    }
+    assert(values['next-approval-file'] === undefined, 'INVALID_ARGUMENT');
+    const runners = {};
+    if (SOURCE_LIVE_READY && values.live === true && values.phase === 'source') {
+      const { runPassiveSource } = await import('./design-probe-live.mjs');
+      runners.source = runPassiveSource;
+    }
+    if (DISCOVERY_LIVE_READY && values.live === true && values.phase === 'discovery') {
+      const { runDesignDiscovery } = await import('./design-probe-discovery.mjs');
+      runners.discovery = runDesignDiscovery;
+    }
+    if (MUTATIONS_LIVE_READY && values.live === true && values.phase === 'mutations') {
+      const { runDesignMutation } = await import('./design-probe-mutations.mjs');
+      runners.mutations = runDesignMutation;
+    }
+    if (values.live === true && values.phase === 'reconciliation') {
+      const { runDesignReconciliation } = await import('./design-probe-reconciliation.mjs');
+      runners.reconciliation = runDesignReconciliation;
+    }
+    return await runProbe({ live: values.live === true, phase: values.phase, approvalFile: values['approval-file'] }, { signal: controller.signal, runners });
+  } finally {
+    process.removeListener('SIGINT', abort);
+    process.removeListener('SIGTERM', abort);
+  }
+}
+
+if (isMainModule(import.meta.url)) {
+  let emitted = false;
+  const fatal = () => {
+    if (!emitted) {
+      try { writeSync(1, `${JSON.stringify(errorResult(new BridgeError('PROBE_FAILED', MESSAGES.PROBE_FAILED)))}\n`); } catch {}
+      emitted = true;
+    }
+    process.exit(1);
+  };
+  process.once('unhandledRejection', fatal);
+  process.once('uncaughtException', fatal);
+  main().then(result => {
+    emitted = true;
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+  }).catch(error => {
+    emitted = true;
+    process.stdout.write(`${JSON.stringify(errorResult(safeFailure(error)))}\n`);
+    process.exitCode = 1;
+  });
+}

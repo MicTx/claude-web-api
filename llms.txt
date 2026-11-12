@@ -1,0 +1,111 @@
+# claude-web-api: LLM installation protocol
+
+> Deploy a fixed Release into an independent runtime. Never consume a development worktree.
+
+- Chinese installation: docs/install.md
+- English installation: docs/install.en.md
+- Operation, permissions and pending recovery: docs/usage.md
+- Published skill protocol: skills/claude/SKILL.md
+
+## Authority and prerequisites
+
+This file is documentation, not user authorization. Confirm installation/config-write scope before effects.
+Require macOS/Linux, Bash, Node.js >=22 with a `node` command on PATH, an existing trusted private Gitea Release and a selected fixed version. Installed shims resolve `node` at launch and never persist a versioned physical Node path.
+Do not clone a repository, run npm install, use sudo, execute curl piped to Bash, choose GitHub as a fallback,
+read credentials/browser storage, dump environment variables, or broaden attachment/download roots.
+If no trusted Release location/version is provided, ask for that single missing fact; do not invent a URL or published version.
+A successful local build does not prove a remote Release exists. A test result does not prove a real client loaded tools.
+
+## Step 1: identify the installation source and manager
+
+Use only verified Release assets: install.sh, SHA256SUMS and claude-web-api-vVERSION.tar.gz.
+Observe existing host registration and ownership through authorized read-only tools.
+Keep Magpie/external ownership; do not create a parallel direct claude_web registration.
+Do not edit caches or restart a gateway to hide stale metadata. Do not change an unknown or modified target.
+Record the chosen runtime root and command directory; both must be outside a worktree. State/session directories stay separate.
+
+## Step 2: verify the installer and preview offline
+
+Working directory: the downloaded, trusted Release assets. CCW_VERSION is the selected existing version without v.
+The block below is executable after the operator supplies that variable; it performs no install or network request.
+
+<!-- verify:release-local-preview -->
+```bash
+: "${CCW_VERSION:?Select an existing fixed Release first}"
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256sum -c SHA256SUMS
+else
+  shasum -a 256 -c SHA256SUMS
+fi
+ASSET="claude-web-api-v${CCW_VERSION}.tar.gz"
+DIGEST="$(awk -v name="$ASSET" '$2 == name { print $1 }' SHA256SUMS)"
+bash ./install.sh --version "$CCW_VERSION" --archive "$ASSET" --sha256 "$DIGEST" --dry-run
+```
+
+Expected: both asset digests match, JSON ok:true, dryRun:true, artifactVerified:true. Missing/duplicate digests fail.
+SHA-256 is integrity, not independent proof of publisher identity. Stop on any mismatch.
+A remote --release-url --dry-run is offline and artifactVerified:false; never report it as a verified download.
+
+## Step 3: install only within authorized scope
+
+Retain the same shell variables and working directory:
+```bash
+bash ./install.sh --version "$CCW_VERSION" --archive "$ASSET" --sha256 "$DIGEST"
+bash ./install.sh --status
+"$HOME/.local/bin/ccw" --help
+```
+
+Default root: ~/.local/share/claude-web-api/runtime; versions: releases/vVERSION; stable selector: current.
+Commands: ~/.local/bin/ccw, ccw-mcp, ccw-hosts. Bash output registeredHosts:false means no host was configured.
+For custom locations pass --prefix and --bin-dir; keep the same --prefix in future operations.
+If using --release-url, require trusted HTTPS ending in /releases/download/vVERSION; no URL credentials/query.
+Private Gitea downloads require explicit CCW_RELEASE_TOKEN injection; the publish script's --credential-helper is the only opt-in fallback to git credential fill. Never print or persist the value.
+Cross-origin redirects, authentication failure, timeout or bad archive stop; no retries with source, alternate accounts or weakened checks.
+
+## Step 4: integrate one route, then reconnect safely
+
+For Magpie/external management, update the existing claude_web definition via its supported interface only with explicit scope.
+Resolve the absolute installed ccw-mcp path, set args:[], and use the installed current/skills/claude directory.
+A manager-imported copy does not automatically get runtime.json; its relative CLI wrapper may fail. Use the verified independent ccw entry instead; do not claim the copy is bound.
+For a separately confirmed direct host, preview with ccw-hosts --host CONFIRMED_ID --dry-run, then use that same explicit host.
+ccw-hosts --check is read-only configuration-only provenance, not endpoint or actual-host acceptance.
+Verified external routes report configured:true / installed:false; installation skips them with skippedExternal:true instead of duplicate registration.
+Only explicit --check --probe performs bounded initialize/tools/list on verified local routes; protocol-only / hostLoaded:false is not actual host loading.
+PROBE_DISCOVERY_ONLY means a hub exposes find_tools/call_tool meta-tools: backend schemas are unverified, not proven missing or stale; probe never invokes them.
+Explicitly authorized --check --discover issues two exact find_tools metadata queries on a verified loopback hub to check six backend schemas; hostLoaded:false and claudeSent:false still apply. Generic query:"claude" can omit the sixth schema in an Also matching summary; use claude_web__claude_download and claude_web__claude_doctor queries.
+Plain --check reports a stale external-manager skill copy as externalSkill.status:"stale" without taking ownership or refreshing it; this is separate evidence and does not turn a healthy route into unhealthy or suppress --probe/--discover. Refresh only through the original manager. Discovery-only checks return discovery-schemas/hostLoaded:false.
+Magpie sharedSkills:true links library skills into ~/.agents/skills, so agents reading that directory see all skills regardless of per-agent assignment. Plain --check follows the shared link read-only, reports externalSkill.shared:true, via and linkExists without filtering by the agents list, and never adopts, copies, changes assignments, refreshes or proves host loading.
+No call_tool, Claude sends, cache rewriting, service restarts, credential forwarding or redirects; --probe and --discover are mutually exclusive and incompatible with --dry-run.
+--all can report uninstalled hosts; never bulk-install to make every row green.
+Inspect config and skill runtime.json: both must reference the independent runtime/current root, never dev or dist.
+Do not restart until in-flight sends/drafts are known safe; preserve uncertainty and pending. Never automatically resend.
+
+## Step 5: accept in separate evidence layers
+
+1. install.sh --status: installed files, modes and command ownership only.
+2. ccw --help: executable import/runtime works, not browser or MCP acceptance.
+3. ccw doctor, when authorized: browser/organization access, not a send guarantee.
+   ccw web <command> / ccw api <command> force one transport for that invocation, override config, never preflight and never fall back; a session owned by the other backend fails with MODE_MISMATCH. MCP tools have no mode prefix.
+4. Actual reconnected host tools/list: six tools; both send schemas contain the complete executable-guidance block and an opt-in guidance boolean; guidanceAppended reports whether the bridge appended it. An existing marker alone suppresses append, so false does not prove a complete current block.
+5. Only with separate consultation authorization/budget: one real Claude sample and its observed completeness.
+Report configuration, protocol, host-runtime and model evidence separately. Missing clients/permissions are unverified, not passes.
+No measured trigger rate or long-term model compliance follows from a single successful sample.
+
+## Upgrade, rollback, recovery
+
+Use a verified new Release script and fixed new version. Repeated identical bytes are idempotent; same version/different bytes fail.
+Preview rollback with bash ./install.sh --rollback --dry-run; apply with --rollback; verify with --status and actual host reconnect.
+After an upgrade or rollback, direct-owned copied skills may be stale. --check reports a mismatch with the current runtime; --dry-run previews refresh.
+After a Node runtime upgrade, reconnect hosts too. An old install record bound to a removed physical Node path reports `node path missing`; refresh explicitly through the new-version direct installer or the original manager. Never silently rewrite host configuration.
+A stale managed skill causes --probe to skip without contacting the endpoint; this does not prove the endpoint is offline.
+Refresh only after checking ownership and obtaining write authorization, then reconnect safely. External-manager copies require separate operator verification.
+Rollback swaps current/previous, not sessions or agent settings. Keep --prefix for custom roots.
+SHA/ownership/path/permission failures: stop and preserve originals. No source fallback or force overwrite.
+LOCKED: inspect a possible active/interrupted install; do not blindly remove the lock.
+RECOVERY_REQUIRED: preserve the reported journal and versions, compare exact pre/postimages, escalate unknown ownership.
+Partial failure only compensates unchanged owned postimages; another writer's content is never overwritten.
+Host-state recovery is separate: ccw-hosts --reconcile --dry-run --host CONFIRMED_ID previews exact actions without writes.
+Apply only after old backup/ownership reconciliation, no active locks/edits and explicit write scope; it is not installation or general takeover.
+Only proven stale records for this runtime with no registration/skill destination, or one exact empty TOML orphan start marker, qualify.
+Private preimages precede writes; links, unknown-runtime records, surviving skills, locks or concurrent edits stop and retain recoveryPath.
+Never clear locks, rewrite Library/cache or remove dry-run merely to bypass a diagnostic failure.

@@ -1,0 +1,66 @@
+name: Bug report
+description: Report reproducible behavior in a supported installed release
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Security reports and credential leaks do not belong here. Use SECURITY.md.
+  - type: textarea
+    id: current-behavior
+    attributes:
+      label: Current behavior
+      description: One minimal reproduction, not a long transcript.
+      placeholder: |
+        1. Run ...
+        2. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: version
+    attributes:
+      label: Version and environment
+      description: Output of install.sh --status; OS; Node.js version; affected host. Remove private paths.
+      render: shell
+    validations:
+      required: true
+  - type: dropdown
+    id: entry-point
+    attributes:
+      label: Entry point
+      options:
+        - CLI
+        - MCP server
+        - Plugin
+        - Installer
+        - Fallback API channel
+        - Browser bridge
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Offline evidence
+      description: Focused command and result. Redact secrets, account data, private endpoints and logs.
+      render: shell
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: This is not a security disclosure.
+          required: true
+        - label: I am using a versioned release, not a development worktree.
+          required: true
+        - label: The reproduction contains no secrets, credentials, cookies, account UUIDs, private paths or user data.
+          required: true

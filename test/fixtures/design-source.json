@@ -1,0 +1,30 @@
+{
+  "synthetic": true,
+  "derivedFrom": "evidence.md#E07",
+  "requestQuery": {
+    "via": "SENTINEL_VIA",
+    "bk": "SENTINEL_BK",
+    "actor": "SENTINEL_ACTOR",
+    "vt": "SENTINEL_VT",
+    "rw": "SENTINEL_RW"
+  },
+  "response": {
+    "ver": "1793937601-52f0",
+    "seq": 1,
+    "history": ["1793937601-52f0"],
+    "fileCount": 1,
+    "files": [
+      {
+        "path": "index.html",
+        "contentType": "text/html",
+        "size": 625,
+        "sha256": "3e2a1161da89e492d2150254d12e852923dba46df8c699b82ee6164b86ae336d"
+      }
+    ],
+    "exportSurface": true,
+    "assetToken": "TOKEN_SENTINEL",
+    "syncToken": "TOKEN_SENTINEL",
+    "author": { "email": "redacted@example.invalid" },
+    "viewer": { "owner": true, "can_edit": true, "token": "TOKEN_SENTINEL" }
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "name": "claude-web-api",
+  "interface": {
+    "displayName": "Claude Web API"
+  },
+  "plugins": [
+    {
+      "name": "claude",
+      "source": {
+        "source": "local",
+        "path": "./plugins/claude"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

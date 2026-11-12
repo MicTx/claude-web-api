@@ -1,0 +1,49 @@
+name: Feature proposal
+description: Propose a narrowly scoped capability or documentation improvement
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What cannot be accomplished today, with a minimal example.
+    validations:
+      required: true
+  - type: textarea
+    id: proposed-solution
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: true
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Primary scope
+      options:
+        - CLI
+        - MCP protocol
+        - Agent plugin
+        - Browser bridge
+        - Fallback API channel
+        - Installation/release
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: checkboxes
+    id: boundaries
+    attributes:
+      label: Boundaries
+      options:
+        - label: This does not require live browser, account or external-network experimentation.
+          required: true
+        - label: This proposal does not request commercial-use authorization.
+          required: true
+        - label: It contains no secrets, private endpoints, account data or user data.
+          required: true

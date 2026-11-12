@@ -1,0 +1,317 @@
+import { constants, promises as fs } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { join } from 'node:path';
+import { BridgeError } from '../src/core/errors.mjs';
+import { activeBranch } from '../src/core/claude-api.mjs';
+import { MUTATION_PROMPT } from './design-probe-mutations.mjs';
+import { confirmMutationTurn, mutationTurn } from './design-probe-turns.mjs';
+import { parseStrictJson } from './design-probe-json.mjs';
+
+const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
+const HASH = /^[a-f0-9]{64}$/;
+const TARGET = /^[a-f0-9]{32}$/i;
+const ROOT = '00000000-0000-4000-8000-000000000000';
+const ORIGIN = 'https://claude.ai';
+const READ = Object.freeze({ reads: 1, sessions: 0, messages: 0, downloads: 0, uploads: 0, shares: 0 });
+const MAX_STATE = 128 * 1024;
+const MAX_HISTORY = 4 * 1024 * 1024;
+const MAX_MESSAGES = 2048;
+const TERMINAL = new Set(['end_turn', 'stop_sequence', 'refusal', 'max_tokens', 'model_context_window_exceeded']);
+const TOOL_NAMES = new Set(['Write', 'Read', 'mcp__claude-artifacts__publish_files']);
+const hash = value => createHash('sha256').update(value).digest('hex');
+const same = (left, right) => left.dev === right.dev && left.ino === right.ino;
+const exact = (value, keys) => value && typeof value === 'object' && !Array.isArray(value)
+  && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
+
+function invalid() {
+  throw new BridgeError('PENDING_BINDING_INVALID', 'The approved pending state is unavailable or changed');
+}
+
+export async function readReconciliationBinding(root, binding) {
+  let handle;
+  try {
+    if (!exact(binding, ['organizationId', 'conversationId', 'parentMessageId', 'promptSha256', 'stateSha256'])
+      || !UUID.test(binding.organizationId ?? '') || !UUID.test(binding.conversationId ?? '')
+      || binding.parentMessageId !== ROOT || !HASH.test(binding.promptSha256 ?? '') || !HASH.test(binding.stateSha256 ?? '')
+      || binding.promptSha256 !== hash(MUTATION_PROMPT)) invalid();
+    const directory = join(root, 'mutation-state');
+    const path = join(directory, 'sessions.json');
+    const directoryBefore = await fs.lstat(directory, { bigint: true });
+    if (await fs.realpath(directory) !== directory || !directoryBefore.isDirectory() || directoryBefore.isSymbolicLink()
+      || directoryBefore.uid !== BigInt(process.getuid()) || (directoryBefore.mode & 0o777n) !== 0o700n
+      || JSON.stringify((await fs.readdir(directory)).sort()) !== JSON.stringify(['sessions.json'])) invalid();
+    const named = await fs.lstat(path, { bigint: true });
+    if (named.isSymbolicLink() || !named.isFile() || named.nlink !== 1n || named.uid !== BigInt(process.getuid())
+      || (named.mode & 0o777n) !== 0o600n || named.size > BigInt(MAX_STATE)) invalid();
+    handle = await fs.open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const before = await handle.stat({ bigint: true });
+    if (!same(named, before) || !before.isFile() || before.nlink !== 1n) invalid();
+    const bytes = Buffer.alloc(MAX_STATE + 1);
+    let size = 0;
+    while (size < bytes.length) {
+      const part = await handle.read(bytes, size, bytes.length - size, null);
+      if (!part.bytesRead) break;
+      size += part.bytesRead;
+    }
+    const after = await handle.stat({ bigint: true });
+    const namedAfter = await fs.lstat(path, { bigint: true });
+    const directoryAfter = await fs.lstat(directory, { bigint: true });
+    if (size > MAX_STATE || BigInt(size) !== before.size || !same(before, after) || !same(before, namedAfter)
+      || !same(directoryBefore, directoryAfter) || directoryAfter.mtimeNs !== directoryBefore.mtimeNs
+      || directoryAfter.ctimeNs !== directoryBefore.ctimeNs || JSON.stringify((await fs.readdir(directory)).sort()) !== JSON.stringify(['sessions.json'])
+      || ![after, namedAfter].every(stat => stat.size === before.size
+        && stat.mtimeNs === before.mtimeNs && stat.ctimeNs === before.ctimeNs && stat.nlink === 1n)
+      || hash(bytes.subarray(0, size)) !== binding.stateSha256) invalid();
+    const state = parseStrictJson(bytes.subarray(0, size), { rejectPrototypeKeys: true });
+    if (!exact(state, ['version', 'lastSubmissionAt', 'sessions']) || state.version !== 1
+      || !Number.isFinite(state.lastSubmissionAt) || state.lastSubmissionAt < 0
+      || !Array.isArray(state.sessions) || state.sessions.length !== 1) invalid();
+    const entry = state.sessions[0];
+    if (!exact(entry, ['session', 'orgId', 'conversationId', 'parentMessageId', 'model', 'createdAt', 'updatedAt', 'pending'])
+      || entry.session !== 'design-g1-probe' || entry.orgId !== binding.organizationId
+      || entry.conversationId !== binding.conversationId || entry.parentMessageId !== binding.parentMessageId
+      || entry.model !== null || !Number.isFinite(Date.parse(entry.createdAt)) || !Number.isFinite(Date.parse(entry.updatedAt))
+      || !exact(entry.pending, ['kind', 'parentMessageId', 'promptSha256', 'startedAt']) || entry.pending.kind !== 'send'
+      || !Number.isFinite(Date.parse(entry.pending.startedAt)) || entry.pending.parentMessageId !== binding.parentMessageId
+      || entry.pending.promptSha256 !== binding.promptSha256) invalid();
+    return Object.freeze({ ...binding });
+  } catch {
+    invalid();
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+function emptyEvidence(binding, status, reason = null) {
+  return { kind: 'reconciliation-evidence', status, reason, stopReason: null, associated: false,
+    humanCount: 0, assistantCount: 0, publicationCandidates: null, toolNames: [],
+    organizationSha256: hash(binding.organizationId), conversationSha256: hash(binding.conversationId),
+    humanSha256: null, assistantSha256: null, revisionStarted: false, targetRetained: true };
+}
+
+export function projectReconciliation(conversation, binding) {
+  const result = emptyEvidence(binding, 'unknown', 'invalid_history');
+  try {
+    if (conversation?.uuid !== binding.conversationId || !Array.isArray(conversation.chat_messages)
+      || conversation.chat_messages.length > MAX_MESSAGES) return result;
+    const branch = activeBranch(conversation);
+    const children = conversation.chat_messages.filter(message => message.parent_message_uuid === binding.parentMessageId);
+    result.humanCount = children.filter(message => message.sender === 'human').length;
+    if (children.length === 0) return { ...result, status: 'human_absent', reason: null };
+    if (children.length !== 1 || children[0].sender !== 'human') return { ...result, status: 'ambiguous', reason: null };
+    const human = children[0];
+    result.humanSha256 = hash(human.uuid);
+    const normalize = value => value.replace(/\r\n?/g, '\n').trim();
+    if (!human.content.every(block => block?.type === 'text' && typeof block.text === 'string')
+      || normalize(human.content.map(block => block.text).join('')) !== normalize(MUTATION_PROMPT)
+      || !Array.isArray(human.attachments) || human.attachments.length || !Array.isArray(human.files) || human.files.length) {
+      return { ...result, status: 'ambiguous', reason: null };
+    }
+    const replies = conversation.chat_messages.filter(message => message.parent_message_uuid === human.uuid);
+    result.assistantCount = replies.filter(message => message.sender === 'assistant').length;
+    if (!replies.length && branch.at(-1)?.uuid === human.uuid) return { ...result, status: 'in_progress_or_nonterminal', reason: null };
+    if (replies.length !== 1 || replies[0].sender !== 'assistant' || branch.at(-1)?.uuid !== replies[0].uuid) {
+      return { ...result, status: 'ambiguous', reason: null };
+    }
+    const assistant = replies[0];
+    result.assistantSha256 = hash(assistant.uuid);
+    result.stopReason = typeof assistant.stop_reason === 'string'
+      ? (TERMINAL.has(assistant.stop_reason) || assistant.stop_reason === 'tool_use' ? assistant.stop_reason : 'other') : null;
+    result.toolNames = [...new Set(assistant.content.filter(block => block?.type === 'tool_use')
+      .map(block => TOOL_NAMES.has(block.name) ? block.name : 'other'))].sort();
+    if (!assistant.content.length || assistant.stop_reason == null || assistant.stop_reason === 'tool_use') {
+      return { ...result, status: 'in_progress_or_nonterminal', reason: null };
+    }
+    const confirmed = confirmMutationTurn(conversation, { parentMessageId: binding.parentMessageId, prompt: MUTATION_PROMPT });
+    if (confirmed.status !== 'confirmed') return result;
+    const parsed = mutationTurn(conversation, { parentMessageId: binding.parentMessageId, prompt: MUTATION_PROMPT });
+    return { ...result, status: confirmed.complete ? 'confirmed_complete' : 'confirmed_truncated', reason: null,
+      associated: true, publicationCandidates: parsed.status === 'publication-candidate' ? parsed.publications.length : null };
+  } catch {
+    return result;
+  }
+}
+
+const SCOPE = `function(path) {
+  return location.href === (path === 'about:blank' ? path : '${ORIGIN}' + path)
+    && document.visibilityState === 'hidden' && !document.hasFocus()
+    && (path !== 'about:blank' || (!!document.body && document.body.childNodes.length === 0
+      && !!document.head && document.head.childNodes.length === 0));
+}`;
+
+const FETCH_HISTORY = `async function(path, limit, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let reader;
+  try {
+    const response = await fetch(path, { method: 'GET', headers: {}, credentials: 'same-origin', redirect: 'error',
+      cache: 'no-store', signal: controller.signal });
+    if (response.status !== 200) {
+      try { await response.body?.cancel(); } catch {}
+      return { status: response.status, text: null, reason: 'http' };
+    }
+    if (String(response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase() !== 'application/json') {
+      try { await response.body?.cancel(); } catch {}
+      return { status: response.status, text: null, reason: 'content_type' };
+    }
+    if (!response.body || Number(response.headers.get('content-length')) > limit) {
+      try { await response.body?.cancel(); } catch {}
+      return { status: response.status, text: null, reason: 'too_large' };
+    }
+    reader = response.body.getReader();
+    const decoder = new TextDecoder('utf-8', { fatal: true });
+    let total = 0;
+    let text = '';
+    for (;;) {
+      const part = await reader.read();
+      if (part.done) break;
+      total += part.value.byteLength;
+      if (total > limit) { await reader.cancel(); return { status: response.status, text: null, reason: 'too_large' }; }
+      text += decoder.decode(part.value, { stream: true });
+    }
+    text += decoder.decode();
+    return { status: response.status, text, reason: null };
+  } catch {
+    return { status: null, text: null, reason: 'request_failed' };
+  } finally {
+    clearTimeout(timer);
+    try { await reader?.cancel(); } catch {}
+  }
+}`;
+
+export async function runDesignReconciliation(context, { connect } = {}) {
+  const binding = context.reconciliationTarget;
+  let client;
+  let targetId;
+  let sessionId;
+  let frameId;
+  let unsubscribe;
+  let invalidScope = false;
+  let navigating = false;
+  let observedLoader = null;
+  let requestCount = 0;
+  let requestId = null;
+  let responseStatus = null;
+  let responseFinished = false;
+  let permittedRequest = false;
+  let creationUncertain = false;
+  const signal = context.signal ? AbortSignal.any([context.signal, AbortSignal.timeout(90_000)]) : AbortSignal.timeout(90_000);
+  const historyPath = `/api/organizations/${binding.organizationId}/chat_conversations/${binding.conversationId}?tree=True&rendering_mode=messages&render_all_tools=true`;
+  const send = (method, params = {}, session = sessionId, timeoutMs = 10_000) => {
+    if (signal.aborted) throw new BridgeError('ABORTED', 'Operation aborted');
+    return client.send(method, params, { ...(session ? { sessionId: session } : {}), signal, timeoutMs });
+  };
+  const assertScope = async path => {
+    if (invalidScope) throw new BridgeError('UI_CONTEXT_LOST', 'The owned page is no longer safely controlled');
+    const info = await send('Target.getTargetInfo', { targetId }, null);
+    const expected = path === 'about:blank' ? path : `${ORIGIN}${path}`;
+    if (info.targetInfo?.targetId !== targetId || info.targetInfo.url !== expected) throw new BridgeError('UI_CONTEXT_LOST', 'Target changed');
+    const world = await send('Page.createIsolatedWorld', { frameId, worldName: 'ccw-reconciliation-scope' });
+    if (!Number.isSafeInteger(world.executionContextId)) throw new BridgeError('UI_CONTEXT_LOST', 'Frame changed');
+    const checked = await send('Runtime.callFunctionOn', { functionDeclaration: SCOPE, executionContextId: world.executionContextId,
+      arguments: [{ value: path }], returnByValue: true });
+    if (checked.exceptionDetails || checked.result?.value !== true || invalidScope) throw new BridgeError('UI_CONTEXT_LOST', 'Page changed');
+    return world.executionContextId;
+  };
+  try {
+    if (typeof connect !== 'function') {
+      connect = async () => {
+        const [{ CdpClient }, { loadConfig }] = await Promise.all([import('../src/core/cdp.mjs'), import('../src/config.mjs')]);
+        return CdpClient.connect(loadConfig().cdpUrl, { signal, timeoutMs: 5_000 });
+      };
+    }
+    client = await context.perform(READ, () => connect(signal));
+    await context.perform(READ, async () => {
+      creationUncertain = true;
+      const created = await send('Target.createTarget', { url: 'about:blank', background: true }, null, 5_000);
+      if (!TARGET.test(created?.targetId ?? '')) throw new BridgeError('TARGET_CREATION_UNCERTAIN', 'Target identity unavailable');
+      targetId = created.targetId;
+      creationUncertain = false;
+      const attached = await send('Target.attachToTarget', { targetId, flatten: true }, null);
+      if (typeof attached.sessionId !== 'string' || !attached.sessionId) throw Error('Missing session');
+      sessionId = attached.sessionId;
+      unsubscribe = client.subscribe(event => {
+        const params = event.params ?? {};
+        if (event.method === 'Target.detachedFromTarget' && params.sessionId === sessionId) invalidScope = true;
+        if (event.sessionId !== sessionId) return;
+        if (event.method === 'Page.javascriptDialogOpening' || event.method === 'Page.frameDetached' && params.frameId === frameId) invalidScope = true;
+        if (event.method === 'Page.navigatedWithinDocument' && params.frameId === frameId) invalidScope = true;
+        if (event.method === 'Page.frameNavigated' && params.frame?.id === frameId) {
+          if (!navigating || params.frame.url !== `${ORIGIN}/new` || observedLoader) invalidScope = true;
+          else observedLoader = params.frame.loaderId;
+        }
+        if (event.method === 'Network.requestWillBeSent') {
+          let pathname;
+          try { pathname = new URL(params.request?.url).pathname; } catch { return; }
+          if (pathname !== historyPath.split('?')[0]) return;
+          if (!permittedRequest || params.request?.method !== 'GET' || params.request.url !== `${ORIGIN}${historyPath}`
+            || params.frameId !== frameId || params.redirectResponse !== undefined || ++requestCount !== 1
+            || typeof params.requestId !== 'string' || !params.requestId) invalidScope = true;
+          else requestId = params.requestId;
+        }
+        if (requestId && params.requestId === requestId && event.method === 'Network.responseReceived') {
+          const response = params.response ?? {};
+          if (responseStatus !== null || params.frameId !== frameId || response.url !== `${ORIGIN}${historyPath}`
+            || response.fromDiskCache || response.fromPrefetchCache || response.fromServiceWorker) invalidScope = true;
+          else responseStatus = response.status;
+        }
+        if (requestId && params.requestId === requestId && event.method === 'Network.loadingFinished') responseFinished = true;
+        if (requestId && params.requestId === requestId && ['Network.loadingFailed', 'Network.requestServedFromCache'].includes(event.method)) invalidScope = true;
+      });
+      await send('Page.enable');
+      await send('Network.enable');
+      const tree = await send('Page.getFrameTree');
+      frameId = tree.frameTree?.frame?.id;
+      if (typeof frameId !== 'string' || !frameId) throw Error('Missing frame');
+      await assertScope('about:blank');
+    });
+    await context.perform(READ, async () => {
+      await assertScope('about:blank');
+      navigating = true;
+      const result = await send('Page.navigate', { url: `${ORIGIN}/new` }, sessionId, 20_000);
+      if (result.errorText || result.frameId !== frameId || !result.loaderId) throw Error('Navigation failed');
+      const deadline = Date.now() + 10_000;
+      while (!observedLoader && !invalidScope && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50));
+      if (invalidScope || observedLoader !== result.loaderId) throw Error('Navigation unverified');
+      navigating = false;
+      await assertScope('/new');
+    });
+    return await context.perform(READ, async () => {
+      const world = await assertScope('/new');
+      permittedRequest = true;
+      const response = await send('Runtime.callFunctionOn', { functionDeclaration: FETCH_HISTORY, executionContextId: world,
+        arguments: [{ value: historyPath }, { value: MAX_HISTORY }, { value: 30_000 }], awaitPromise: true, returnByValue: true }, sessionId, 35_000);
+      if (response.exceptionDetails || invalidScope) throw new BridgeError('UI_CONTEXT_LOST', 'History read was interrupted');
+      const value = response.result?.value;
+      await assertScope('/new');
+      if (['http', 'too_large', 'content_type'].includes(value?.reason)) {
+        if (invalidScope || requestCount !== 1 || responseStatus !== value.status) return emptyEvidence(binding, 'unknown', 'network_unverified');
+        if (value.status === 404) return emptyEvidence(binding, 'conversation_not_found');
+        return emptyEvidence(binding, 'unknown', ['too_large', 'content_type'].includes(value.reason) ? value.reason : 'http_or_request');
+      }
+      const deadline = Date.now() + 5_000;
+      while ((!responseFinished || responseStatus === null) && !invalidScope && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50));
+      await assertScope('/new');
+      if (invalidScope || requestCount !== 1 || !responseFinished || responseStatus !== response.result?.value?.status) {
+        return emptyEvidence(binding, 'unknown', 'network_unverified');
+      }
+      if (value.status === 404) return emptyEvidence(binding, 'conversation_not_found');
+      if (value.status !== 200 || value.reason !== null || typeof value.text !== 'string'
+        || Buffer.byteLength(value.text) > MAX_HISTORY) {
+        return emptyEvidence(binding, 'unknown', ['too_large', 'content_type'].includes(value.reason) ? value.reason : 'http_or_request');
+      }
+      let history;
+      try { history = parseStrictJson(Buffer.from(value.text), { rejectPrototypeKeys: true }); }
+      catch { return emptyEvidence(binding, 'unknown', 'invalid_history'); }
+      return projectReconciliation(history, binding);
+    });
+  } catch (error) {
+    if (creationUncertain) throw new BridgeError('TARGET_CREATION_UNCERTAIN', 'Target identity unavailable', { creationUncertain: true });
+    if (error instanceof BridgeError) throw error;
+    throw new BridgeError(signal.aborted ? 'ABORTED' : 'PROBE_FAILED', 'The read-only reconciliation did not complete safely',
+      { targetRetained: Boolean(targetId) });
+  } finally {
+    try { unsubscribe?.(); } catch {}
+    try { client?.close(); } catch {}
+  }
+}
