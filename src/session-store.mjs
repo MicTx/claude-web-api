@@ -92,6 +92,14 @@ export function emptyState() {
   return { version: 1, lastSubmissionAt: 0, sessions: [] };
 }
 
+export function assertPrivateStateFile(stat, name, errorCode) {
+  if (stat.isSymbolicLink() || !stat.isFile()) throw new BridgeError(errorCode, `${name} must be a regular file`);
+  if ((stat.mode & 0o077) !== 0) throw new BridgeError(errorCode, `${name} must not grant permissions to group or other users`);
+  if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
+    throw new BridgeError(errorCode, `${name} is owned by another user`);
+  }
+}
+
 function validateLockContent(content) {
   if (!content || typeof content !== 'object'
     || !Number.isSafeInteger(content.pid) || content.pid <= 0
@@ -271,12 +279,7 @@ export class SessionStore {
         throw new BridgeError('STATE_UNSAFE', 'State directory is a symlink');
       }
       const st = await this.io.lstat(this.file);
-      if (st.isSymbolicLink()) {
-        throw new BridgeError('STATE_UNSAFE', 'sessions.json is a symlink');
-      }
-      if (!st.isFile()) {
-        throw new BridgeError('STATE_UNSAFE', 'sessions.json is not a regular file');
-      }
+      assertPrivateStateFile(st, 'sessions.json', 'STATE_UNSAFE');
       text = await this.io.readFile(this.file, 'utf8');
     } catch (error) {
       if (error instanceof BridgeError) throw error;
@@ -297,9 +300,7 @@ export class SessionStore {
     await this.#ensureDir();
     try {
       const st = await this.io.lstat(this.file);
-      if (st.isSymbolicLink() || !st.isFile()) {
-        throw new BridgeError('STATE_UNSAFE', 'Refusing to write to a non-regular sessions.json');
-      }
+      assertPrivateStateFile(st, 'sessions.json', 'STATE_UNSAFE');
     } catch (error) {
       if (error instanceof BridgeError) throw error;
       if (error.code !== 'ENOENT') throw error;

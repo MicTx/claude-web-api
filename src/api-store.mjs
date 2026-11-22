@@ -2,7 +2,7 @@ import { promises as fs } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { BridgeError } from './core/errors.mjs';
-import { ensureStateDir, StateLock, ALIAS_RE } from './session-store.mjs';
+import { assertPrivateStateFile, ensureStateDir, StateLock, ALIAS_RE } from './session-store.mjs';
 import { MAX_API_CONTEXT_BYTES, MAX_API_REPLY_BYTES, completionForStopReason } from './api-client.mjs';
 import { API_PROTOCOLS } from './api-config.mjs';
 
@@ -161,9 +161,7 @@ export class ApiStore {
     }
     try {
       const st = await this.io.lstat(this.file);
-      if (st.isSymbolicLink() || !st.isFile()) unsafe('api-sessions.json must be a regular file');
-      if ((st.mode & 0o077) !== 0) unsafe('api-sessions.json is readable by other users; fix its permissions instead of relaxing the check');
-      if (typeof process.getuid === 'function' && st.uid !== process.getuid()) unsafe('api-sessions.json is owned by another user');
+      assertPrivateStateFile(st, 'api-sessions.json', 'API_STATE_UNSAFE');
       if (st.size > MAX_API_FILE_BYTES) throw new BridgeError('API_STATE_TOO_LARGE', 'Private API history exceeds the read limit; preserve a backup for inspection');
       return st;
     } catch (error) {

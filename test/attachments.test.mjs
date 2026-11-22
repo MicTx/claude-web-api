@@ -36,7 +36,8 @@ test('attachments: file policy snapshots only explicitly authorized files', asyn
     assert.equal(file.name, expected[i][0]);
     assert.equal(Object.hasOwn(file, 'path'), false);
   });
-  await assert.rejects(prepareAttachments(uploadPaths, {}), { code: 'ATTACHMENT_SCOPE' });
+  await assert.rejects(prepareAttachments(uploadPaths, {}), error => error.code === 'ATTACHMENT_SCOPE'
+    && error.message.includes('config.json') && error.message.includes('not started'));
   assert.deepEqual(await prepareAttachments(undefined, {}), []);
 });
 

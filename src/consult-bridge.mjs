@@ -330,12 +330,32 @@ export class ConsultBridge {
     };
     if (this.#backend() === 'api') {
       // No request is sent; the credential file is only checked locally.
-      return { ok: true, backend: 'api', protocol: profile.protocol, api: apiProfile };
+      return {
+        ok: true,
+        backend: 'api',
+        protocol: profile.protocol,
+        attachments: {
+          configured: Boolean(this.config.attachmentRootReal),
+          source: this.config.attachmentRootReal ? (this.config.attachmentRootSource ?? 'unknown') : null,
+          configFile: this.config.attachmentConfigFile ?? null,
+          environmentVariable: 'CCW_ATTACHMENT_ROOT',
+          supported: false,
+        },
+        api: apiProfile,
+      };
     }
     const probe = await this.#probeWeb(signal, true);
     if (probe.ok) return { ...probe.result, backend: 'web' };
     if (profile.configured && WEB_FALLBACK_CODES.has(probe.code)) {
-      return { ok: true, backend: 'api', protocol: profile.protocol, fallback: true, webError: probe.code, api: apiProfile,
+      return { ok: true, backend: 'api', protocol: profile.protocol, fallback: true, webError: probe.code,
+        attachments: {
+          configured: Boolean(this.config.attachmentRootReal),
+          source: this.config.attachmentRootReal ? (this.config.attachmentRootSource ?? 'unknown') : null,
+          configFile: this.config.attachmentConfigFile ?? null,
+          environmentVariable: 'CCW_ATTACHMENT_ROOT',
+          supported: false,
+        },
+        api: apiProfile,
         ...(probe.cleanup ? { webPreflightCleanup: probe.cleanup } : {}) };
     }
     throw probe.error;

@@ -1,5 +1,5 @@
 import { realpathSync, statSync, openSync, closeSync, fstatSync, lstatSync, readSync, constants } from 'node:fs';
-import { resolve, isAbsolute } from 'node:path';
+import { resolve, relative, isAbsolute, sep } from 'node:path';
 import { BridgeError } from './core/errors.mjs';
 import { configureApi } from './api-config.mjs';
 import { configPath, defaultStateDir } from './identity.mjs';
@@ -69,13 +69,11 @@ function readStartupConfigFile(path) {
 }
 
 function startupConfig(env) {
-  if (!env.HOME) return {};
+  if (!env.HOME) return { data: {}, path: null };
   if (typeof env.HOME !== 'string' || !isAbsolute(env.HOME) || env.HOME.includes('\0')) throw new BridgeError('CONFIG_INVALID', 'HOME must be an absolute directory');
-  for (const path of [configPath(env.HOME)]) {
-    const data = readStartupConfigFile(path);
-    if (data !== null) return data;
-  }
-  return {};
+  const path = configPath(env.HOME);
+  const data = readStartupConfigFile(path);
+  return { data: data ?? {}, path };
 }
 
 function parsePositiveInt(raw, name) {
@@ -122,7 +120,20 @@ function validateCdpUrl(raw) {
   return `http://${url.hostname === '[::1]' ? '[::1]' : url.hostname}:${url.port}`;
 }
 
+function expandAttachmentRoot(raw, home) {
+  if (typeof raw !== 'string') return { path: raw, homeRelative: false };
+  let relative;
+  if (raw.startsWith('~/')) relative = raw.slice(2);
+  else if (raw.startsWith('$HOME/')) relative = raw.slice(6);
+  else return { path: raw, homeRelative: false };
+  if (typeof home !== 'string' || !isAbsolute(home) || home.includes('\0')) {
+    throw new BridgeError('CONFIG_INVALID', 'HOME must be an absolute directory when attachmentRoot uses ~/ or $HOME/');
+  }
+  return { path: resolve(home, relative), homeRelative: true };
+}
+
 export function loadConfig(env = process.env, overrides = {}) {
+  const startup = startupConfig(env);
   const raw = {
     cdpUrl: null,
     stateDir: defaultStateDir(env),
@@ -142,13 +153,20 @@ export function loadConfig(env = process.env, overrides = {}) {
     apiCache: 'ephemeral',
     apiReasoning: 'off',
     apiProtocol: 'messages',
-    ...startupConfig(env),
+    ...startup.data,
   };
+  let attachmentRootSource = Object.hasOwn(startup.data, 'attachmentRoot') ? 'config' : null;
   for (const [key, variable] of Object.entries(ENV_KEYS)) {
-    if (env[variable] !== undefined) raw[key] = env[variable];
+    if (env[variable] !== undefined) {
+      raw[key] = env[variable];
+      if (key === 'attachmentRoot') attachmentRootSource = 'env';
+    }
   }
   for (const [key, value] of Object.entries(overrides)) {
-    if (value !== undefined && Object.hasOwn(raw, key)) raw[key] = value;
+    if (value !== undefined && Object.hasOwn(raw, key)) {
+      raw[key] = value;
+      if (key === 'attachmentRoot') attachmentRootSource = 'override';
+    }
   }
 
   if (raw.cdpUrl !== null) raw.cdpUrl = validateCdpUrl(raw.cdpUrl);
@@ -163,6 +181,8 @@ export function loadConfig(env = process.env, overrides = {}) {
 
   raw.attachmentRootReal = null;
   if (raw.attachmentRoot !== null) {
+    const expandedAttachmentRoot = expandAttachmentRoot(raw.attachmentRoot, env.HOME);
+    raw.attachmentRoot = expandedAttachmentRoot.path;
     if (typeof raw.attachmentRoot !== 'string' || !isAbsolute(raw.attachmentRoot) || raw.attachmentRoot.includes('\0')) {
       throw new BridgeError('CONFIG_INVALID', 'attachmentRoot must be an absolute directory path');
     }
@@ -170,8 +190,17 @@ export function loadConfig(env = process.env, overrides = {}) {
       raw.attachmentRoot = resolve(raw.attachmentRoot);
       raw.attachmentRootReal = realpathSync(raw.attachmentRoot);
       if (!statSync(raw.attachmentRootReal).isDirectory()) throw new Error('not a directory');
+      if (expandedAttachmentRoot.homeRelative) {
+        const homeReal = realpathSync(env.HOME);
+        const relativeToHome = relative(homeReal, raw.attachmentRootReal);
+        if (!relativeToHome || relativeToHome === '..' || relativeToHome.startsWith(`..${sep}`) || isAbsolute(relativeToHome)) {
+          throw new Error('home-relative attachment root escapes HOME or names HOME itself');
+        }
+      }
     } catch {
-      throw new BridgeError('CONFIG_INVALID', 'attachmentRoot must name an existing accessible directory');
+      throw new BridgeError('CONFIG_INVALID', expandedAttachmentRoot.homeRelative
+        ? 'Home-relative attachmentRoot must be an existing directory strictly inside HOME'
+        : 'attachmentRoot must name an existing accessible directory');
     }
   }
 
@@ -211,5 +240,10 @@ export function loadConfig(env = process.env, overrides = {}) {
   Object.defineProperty(raw, 'home', { value: env.HOME ?? null, enumerable: false });
   Object.defineProperty(raw, 'env', { value: env, enumerable: false });
   Object.defineProperty(raw, 'platform', { value: process.platform, enumerable: false });
+  Object.defineProperty(raw, 'attachmentRootSource', { value: attachmentRootSource, enumerable: false });
+  Object.defineProperty(raw, 'attachmentConfigFile', {
+    value: startup.path ? '$HOME/.config/claude-web-api/config.json' : null,
+    enumerable: false,
+  });
   return raw;
 }

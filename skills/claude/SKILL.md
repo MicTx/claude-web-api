@@ -81,7 +81,8 @@ MCP 的 `initialize.instructions` 是给宿主的，不会自动出现在被咨�
 
 ## 双向附件
 
-- **逐文件授权，不上传仓库。** 仅使用用户明确选定的绝对路径；启动方须预先设置 `CCW_ATTACHMENT_ROOT` 或只读启动文件 `$HOME/.config/claude-web-api/config.json` 的 `attachmentRoot`。部分宿主（例如 Codex）会过滤自定义环境变量，MCP/原生插件应由用户使用该文件配置。根目录未配置或文件越界时暂停，请启动方处理；不自行写配置、不用工具参数或新进程环境扩大根，授权变更后再重连。
+- **逐文件授权，不上传仓库。** 仅使用用户明确选定的绝对路径；启动方须预先设置 `CCW_ATTACHMENT_ROOT` 或只读启动文件 `$HOME/.config/claude-web-api/config.json` 的 `attachmentRoot`。配置文件支持 `~/...` 与 `$HOME/...`，目录须预先存在且严格位于 HOME 内；不要把特定机器的用户名或固定绝对路径写入可移植配置，也不要自动创建目录。部分宿主（例如 Codex）会过滤自定义环境变量，MCP/原生插件应由用户使用该文件配置。根目录未配置或文件越界时暂停，请启动方处理；不自行写配置、不用工具参数或新进程环境扩大根，授权变更后再重连。`claude_doctor` 会报告附件根是否已配置及来源，但不回显实际根路径。
+- **前置授权拒绝不产生 pending。** 带附件的调用在启动根缺失时会在浏览器、session 和 pending 之前返回 `ATTACHMENT_SCOPE`；这是预期的 fail-closed 行为。不要为获得待确认状态而伪造 pending、静默删除附件或改走文本回退；无附件的文本咨询不依赖附件根。
 - 上传仅支持 PNG 和 UTF-8 `.js`，拒绝 PDF 附件；最多 5 个，每个最多 2 MiB，代码最多 64 KiB，总计最多 4 MiB。其他格式拒绝；不拼接、改名、打包、拆批或塞进 prompt 绕过禁仓库边界，不读取 import、邻接文件、凭据或浏览器存储。
 - 在 `claude_ask` / `claude_follow_up` 传 `attachments: ["/approved/file.js"]`，CLI 重复使用 `--attach`。`--file` 仍只读取问题文本，不是附件。首次没有输入附件、但需要 Claude 生成文件时，可在发送前选 `native: true` / `--native`；错误后不能换通道重试。
 - 同一 session 保留远端附件上下文；追问只附新增、另获授权的文件，不为维持上下文再次上传旧文件。上传未就绪、取消、发送结果不确定时，不自动重新上传或改成只发文字；先读 transcript，核对 pending 与原附件身份。无法证明完成就暂停。

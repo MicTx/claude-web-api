@@ -190,7 +190,7 @@ export async function prepareAttachments(paths, config, { signal, io = fs } = {}
   if (paths.length === 0) return [];
   paths = [...paths];
   if (typeof config.attachmentRoot !== 'string' || !isAbsolute(config.attachmentRoot)) {
-    throw new BridgeError('ATTACHMENT_SCOPE', 'Uploads require an operator-configured CCW_ATTACHMENT_ROOT');
+    throw new BridgeError('ATTACHMENT_SCOPE', 'Uploads require an approved attachment root. Set "attachmentRoot" to an existing ~/directory in $HOME/.config/claude-web-api/config.json or configure CCW_ATTACHMENT_ROOT before startup, then reconnect the bridge; this request was not started');
   }
   if (!Number.isInteger(constants.O_NOFOLLOW) || !Number.isInteger(constants.O_NONBLOCK)) {
     throw new BridgeError('FILE_UNSAFE', 'Secure attachment opening is unavailable on this platform');

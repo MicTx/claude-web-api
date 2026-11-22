@@ -25,6 +25,8 @@ test('config: defaults and loopback variants', async () => {
   assert.equal(c.timeoutMs, 600_000);
   assert.equal(c.idleTimeoutMs, 120_000);
   assert.equal(c.stateDir, join(home, '.local', 'share', 'claude-web-api'));
+  assert.equal(c.attachmentRootSource, null);
+  assert.equal(c.attachmentConfigFile, '$HOME/.config/claude-web-api/config.json');
 
   assert.equal(loadConfig({ HOME: home, CCW_CDP_URL: 'http://localhost:9333' }).cdpUrl, 'http://localhost:9333');
   assert.equal(loadConfig({ HOME: home, CCW_CDP_URL: 'http://[::1]:9333' }).cdpUrl, 'http://[::1]:9333');
@@ -41,11 +43,37 @@ test('config: startup file supplies filtered MCP environments without writing co
   const conf = loadConfig({ HOME: home });
   assert.equal(conf.cdpUrl, 'http://127.0.0.1:9222');
   assert.equal(conf.attachmentRootReal, await fs.realpath(home));
+  assert.equal(conf.attachmentRootSource, 'config');
+  assert.equal(conf.attachmentConfigFile, '$HOME/.config/claude-web-api/config.json');
   assert.equal(conf.timeoutMs, 4000);
   assert.equal(conf.stateDir, join(home, '.local', 'share', 'claude-web-api'));
   assert.equal(loadConfig({ HOME: home, CCW_TIMEOUT_MS: '5000', CCW_CDP_URL: 'http://localhost:9333' }).timeoutMs, 5000);
   assert.equal(loadConfig({ HOME: home, CCW_TIMEOUT_MS: undefined }).timeoutMs, 4000);
+  assert.equal(loadConfig({ HOME: home, CCW_ATTACHMENT_ROOT: home }).attachmentRootSource, 'env');
   assert.equal(await fs.readFile(path, 'utf8'), bytes);
+});
+
+test('config: attachment roots may use portable HOME-relative prefixes', async () => {
+  const home = await makeTmpDir('ccw-config-');
+  const approved = join(home, 'approved');
+  await fs.mkdir(approved);
+  for (const value of ['~/approved', '$HOME/approved']) {
+    const configDir = join(home, '.config', 'claude-web-api');
+    await fs.mkdir(configDir, { recursive: true, mode: 0o700 });
+    await fs.writeFile(join(configDir, 'config.json'), JSON.stringify({ attachmentRoot: value }), { mode: 0o600 });
+    const conf = loadConfig({ HOME: home });
+    assert.equal(conf.attachmentRoot, approved);
+    assert.equal(conf.attachmentRootReal, await fs.realpath(approved));
+    assert.equal(conf.attachmentRootSource, 'config');
+  }
+  const linkedHome = join(home, 'linked-home');
+  await fs.symlink(home, linkedHome);
+  for (const value of ['~', '$HOME', '~/..', '~/linked-home']) {
+    assert.throws(() => loadConfig({ HOME: home }, { attachmentRoot: value }), { code: 'CONFIG_INVALID' }, value);
+  }
+  assert.throws(() => loadConfig({ HOME: home }, { attachmentRoot: '~/missing' }), { code: 'CONFIG_INVALID' });
+  assert.throws(() => loadConfig({ HOME: home }, { attachmentRoot: '~' }), { code: 'CONFIG_INVALID' });
+  assert.throws(() => loadConfig({ HOME: home }, { attachmentRoot: '${HOME}/approved' }), { code: 'CONFIG_INVALID' });
 });
 
 test('config: directories under another product name are never read', async () => {

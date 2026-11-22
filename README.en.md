@@ -1,6 +1,6 @@
 # claude-web-api
 
-Let agent hosts consult Claude through a local browser session with continuous follow-up conversations.
+A local-browser Claude consultation bridge for agent hosts with continuous follow-ups.
 
 **English** · [简体中文](README.md)
 
@@ -8,7 +8,7 @@ Let agent hosts consult Claude through a local browser session with continuous f
 
 **This project provides no event hooks.** Within existing user authorization, the host proactively assesses planning, hard problem-solving and complex reasoning; semantic matching is not a deterministic trigger. The prompt must give sufficient but lean context (about 8 KiB by default) and explicitly require ultrathink reasoning, file-level guidance, an aggressive root-cause solution and a justified revision of any unreasonable verification gate with criteria and rollback; then include a preferred solution, prerequisites, ordered concrete steps, exact commands, success observations, failure handling and end-to-end verification. `--guidance` / `guidance: true` appends a fixed block only when no guidance marker exists; the default leaves the prompt unchanged and reports `guidanceAppended`. An older or incomplete marker is not repaired automatically. Every executable step labels facts `已核验` or `需本地核查`; decisions name a falsifiable point, rejected alternatives and switch conditions. See the [fixed guidance block and CLI example](docs/usage.md#可执行端到端指导).
 
-Contents: [Documentation](#documentation) · [Requirements](#requirements) · [Setup](#setup) · [Limitations](#limitations)
+Contents: [Documentation](#documentation) · [Requirements](#requirements) · [Setup](#setup) · [Configuration](#configuration-and-optional-channel) · [Development and tests](#development-and-tests-not-consumer-installation) · [Limitations](#limitations) · [Community and license](#community-and-license)
 
 ## Documentation
 
@@ -106,7 +106,7 @@ Results are one JSON line per invocation; failures exit non-zero. `--recover` cl
 
 ## Configuration and optional channel
 
-CLI, MCP and plugin share the read-only `$HOME/.config/claude-web-api/config.json`. It is not created automatically; uploads are disabled by default. Some hosts filter inherited environment variables, so operators should configure MCP/plugin browser access and approved file roots in this file. Uploads accept explicitly selected PNG and UTF-8 `.js` files; PDF attachments and PDF files disguised as code are refused. Returned PDF chat files can still be downloaded. Never upload a repository, expand directories or follow imports. File identity, restored drafts and `PROMPT_MISMATCH` boundaries are in the [usage guide](docs/usage.md#显式附件与回拉).
+CLI, MCP and plugin share the read-only `$HOME/.config/claude-web-api/config.json`. It is not created automatically; uploads are disabled by default while text-only sends remain available. Some hosts filter inherited environment variables, so operators should configure MCP/plugin browser access and approved file roots in this file. Attachment roots may use `~/...` or `$HOME/...` to avoid machine-specific absolute paths; the directory must already exist strictly inside HOME. Uploads accept explicitly selected PNG and UTF-8 `.js` files; PDF attachments and PDF files disguised as code are refused. Missing attachment scope is rejected before browser, session or pending effects; it is never turned into a fake confirmation request. Returned PDF chat files can still be downloaded. Never upload a repository, expand directories or follow imports. File identity, restored drafts and `PROMPT_MISMATCH` boundaries are in the [usage guide](docs/usage.md#显式附件与回拉).
 
 `CCW_CDP_URL` (empty by default, enabling discovery), `CCW_STATE_DIR`, `CCW_TIMEOUT_MS`, `CCW_ATTACHMENT_ROOT` and other environment variables override the configuration file. Only routing-sensitive options are listed here; all defaults are in the [usage guide](docs/usage.md#启动配置):
 

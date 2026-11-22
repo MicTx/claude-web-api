@@ -191,22 +191,22 @@ if (input.guidance !== true && !hasMarker) {
 
 ## 启动配置
 
-进程启动时只读 `$HOME/.config/claude-web-api/config.json`；不创建或改写它。文件缺失时使用默认值，上传仍禁用。由用户选择并创建配置，不由模型自行扩大授权根：
+进程启动时只读 `$HOME/.config/claude-web-api/config.json`；不创建或改写它。文件缺失时使用默认值，上传仍禁用，但纯文本发送不受影响。由用户选择并创建配置，不由模型自行扩大授权根：
 
 ```json
 {
-  "attachmentRoot": "/absolute/approved-files"
+  "attachmentRoot": "~/approved-files"
 }
 ```
 
-将示例替换为已有的绝对目录。配置文件须属于当前用户，是非链接的普通文件，最多 16 KiB，不能被组/其他用户写入（建议 `0600`）；未知字段、无效类型、文件替换和错误内容均拒绝，错误不回显内容。
+`~/...` 和 `$HOME/...` 会按启动进程的 HOME 展开；目录必须已存在、严格位于 HOME 内，且不能指向 HOME 本身。不会自动创建附件目录。也可使用绝对目录，但应避免把特定机器的用户名或路径写入可移植配置。配置文件须属于当前用户，是非链接的普通文件，最多 16 KiB，不能被组/其他用户写入（建议 `0600`）；未知字段、无效类型、文件替换和错误内容均拒绝，错误不回显内容。
 
 | JSON 字段 | 对应环境变量 | 默认 / 约束 |
 |---|---|---|
 | `cdpUrl` | `CCW_CDP_URL` | `null`；未显式配置时自动发现，配置后仅接受 loopback HTTP 和显式端口 |
 | `stateDir` | `CCW_STATE_DIR` | `$HOME/.local/share/claude-web-api`；绝对路径 |
 | `orgId` | `CCW_ORG_ID` | `null`；多个 chat 组织时必须指定 UUID |
-| `attachmentRoot` | `CCW_ATTACHMENT_ROOT` | `null` 禁止上传；启用时必须是已有绝对目录 |
+| `attachmentRoot` | `CCW_ATTACHMENT_ROOT` | `null` 禁止上传；启用时可用已有的 `~/...`、`$HOME/...` 或绝对目录；相对形式必须严格位于 HOME 内 |
 | `downloadRoot` | `CCW_DOWNLOAD_ROOT` | `null` 使用状态目录的 `downloads`；自定义根须已存在 |
 | `timeoutMs` | `CCW_TIMEOUT_MS` | `600000`；1000–600000 |
 | `idleTimeoutMs` | `CCW_IDLE_TIMEOUT_MS` | `120000`；正整数，不大于总超时 |
@@ -222,7 +222,9 @@ if (input.guidance !== true && !hasMarker) {
 | `apiCache` | `CCW_API_CACHE` | `ephemeral`；Messages 消息前缀断点，`off` 不发送断点；Chat/Responses 使用服务端自动缓存 |
 | `apiReasoning` | `CCW_API_REASONING` | `off`；`low`/`medium`/`high`/`xhigh`/`max`；Chat/Responses 另接受 `none`/`minimal`，支持范围取决于模型 |
 
-仅已定义的环境变量覆盖配置字段；未定义值不清除文件配置。根在启动时解析并固定，工具参数不能重定向；修改配置后须重启 MCP/重新加载插件。部分宿主（Codex 默认即如此）会过滤自定义环境变量，原生插件也不支持任意 `${ENV_VAR}` 展开，因此不要仅在启动宿主前 `export CCW_ATTACHMENT_ROOT` 就假定 MCP 已获得它。普通安装和插件都应使用上述配置文件；安装器不改写它或客户端的环境转发策略。
+仅已定义的环境变量覆盖配置字段；未定义值不清除文件配置。根在启动时解析并固定，工具参数不能重定向；修改配置后须重启 MCP/重新加载插件。部分宿主（Codex 默认即如此）会过滤自定义环境变量，原生插件也不支持任意 `${ENV_VAR}` 展开，因此不要仅在启动宿主前 `export CCW_ATTACHMENT_ROOT` 就假定 MCP 已获得它。普通安装和插件都应使用上述配置文件；安装器不改写它或客户端的环境转发策略。`claude_doctor` 会在 `attachments` 中报告附件能力是否已配置及来源；该诊断不返回批准根的实际路径。
+
+当调用显式携带附件而启动时没有批准根，桥接会在浏览器、远端会话和 `pending` 状态产生前返回 `ATTACHMENT_SCOPE`。这是有意的前置授权拒绝，不应通过创建一个之后必然失败的待确认请求来伪装成可恢复发送。请由操作者写入 `attachmentRoot` 后重连桥接；不要静默去掉附件、自动选根或改走备用文本通道。
 
 ### 浏览器发现
 
@@ -386,6 +388,8 @@ ccw native-resume --session NAME --file /absolute/private/original-prompt.txt
 ## 状态目录内容
 
 `CCW_STATE_DIR/sessions.json` 只有必要元数据：别名、org/会话/消息 UUID、模型、时间戳、pending（kind、通道、父指针、问题摘要、开始时间、附件名称/大小/类型/摘要/上传 ID）。不存正文、附件内容、完整输入路径、cookie、隐藏推理或浏览器配置。支持旧 v1 文本状态；原生事务使用 v2，旧客户端必须拒绝而不能忽略附件身份。不要手动降级状态版本。
+
+读取或替换已有状态文件时，`sessions.json` 和 `api-sessions.json` 都必须是普通文件（不是符号链接），且不得给组或其他用户任何权限；系统提供 UID 时，属主还必须是当前用户。新文件以 `0600` 创建。不符合要求时，网页状态返回 `STATE_UNSAFE`，备用 API 状态返回 `API_STATE_UNSAFE`，均保留原文件。遇到这些错误，先核实文件的来源、属主和内容完整性；不能确认时不要继续使用该历史。仅执行 `chmod 600` 无法撤销先前可能发生的修改，因此程序不会自动修复权限或重建文件。
 
 ## 其他
 

@@ -38,6 +38,13 @@ export async function webDoctorPayload(config, tab, orgId, modelCatalog = null) 
     authenticated: true,
     orgId,
     protocol: 'rest-sse',
+    attachments: {
+      configured: Boolean(config.attachmentRootReal),
+      source: config.attachmentRootReal ? (config.attachmentRootSource ?? 'unknown') : null,
+      configFile: config.attachmentConfigFile ?? null,
+      environmentVariable: 'CCW_ATTACHMENT_ROOT',
+      supported: true,
+    },
     model: {
       catalog: modelCatalog?.models ?? [],
       defaultModel: modelCatalog?.defaultModel ?? null,

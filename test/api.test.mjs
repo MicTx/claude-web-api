@@ -452,6 +452,27 @@ test('api: credential binding never changes an uncertain send or accepts unsafe 
   });
 });
 
+test('session-store-private: route refuses unsafe web state', async (context) => {
+  const stateDir = await makeTmpDir();
+  const file = join(stateDir, 'sessions.json');
+  const session = 'web-route';
+  const timestamp = '2026-11-05T00:00:00.000Z';
+  await fs.writeFile(file, JSON.stringify({ version: 1, lastSubmissionAt: 0, sessions: [{
+    session, orgId: fx.ORG_ID, conversationId: fx.CONV_ID, parentMessageId: ROOT_PARENT,
+    model: null, createdAt: timestamp, updatedAt: timestamp, pending: null,
+  }] }), { mode: 0o600 });
+  const web = { transcript: context.mock.fn(async () => ({})) };
+  const api = { transcript: context.mock.fn(async () => ({})) };
+  const bridge = new ConsultBridge({ stateDir, backend: 'web' }, { web, api });
+  await fs.chmod(file, 0o644);
+  await assert.rejects(() => bridge.transcript({ session }), { code: 'STATE_UNSAFE' });
+  assert.equal(web.transcript.mock.callCount(), 0);
+  assert.equal(api.transcript.mock.callCount(), 0);
+  await fs.chmod(file, 0o600);
+  assert.equal((await bridge.transcript({ session })).backend, 'web');
+  assert.equal(web.transcript.mock.callCount(), 1);
+});
+
 test('api: state rejects corrupt, linked, open or oversized private history', async () => {
   const dir = await makeTmpDir();
   const store = new ApiStore(dir);

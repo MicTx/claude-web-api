@@ -45,7 +45,7 @@ pending attempt (API or native), requires --recover, and for native sessions
 re-anchors the alias to the current server leaf. It never sends.
 api-bind-credential changes local history binding without sending; adoption of
 legacy history cannot verify its original credential identity.
-Uploads require attachmentRoot or CCW_ATTACHMENT_ROOT; supported formats: PNG, UTF-8 .js (PDF is refused).
+Uploads require attachmentRoot in $HOME/.config/claude-web-api/config.json or CCW_ATTACHMENT_ROOT at startup; config paths may use ~/directory or $HOME/directory. The directory must already exist strictly inside HOME. Supported formats: PNG, UTF-8 .js (PDF is refused). Missing scope fails before browser/session/pending effects.
 native-resume requires the original normalized prompt and, for attachment turns, binary file IDs; mismatches are refused. It submits once and never re-uploads or retries.
 Native sends recheck the server branch before each click while waiting for a temporarily disabled control; success reports autoRecovered.
 --file reads question text only. Independent Frame Artifacts download only when listed as downloadable; other Frame exports stay unverified.

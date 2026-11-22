@@ -45,10 +45,82 @@ test('store: save/load roundtrip, perms, atomic result', async () => {
   assert.deepEqual(leftovers, []);
 });
 
+async function privateStateFixture(testContext, mode, { foreignOwner = false } = {}) {
+  const dir = await makeTmpDir();
+  const initial = { version: 1, lastSubmissionAt: 5, sessions: [] };
+  const original = new SessionStore(dir);
+  await original.save(initial);
+  const file = original.file;
+  await fs.chmod(file, mode);
+  const before = await fs.stat(file);
+  const bytes = await fs.readFile(file);
+  const io = {
+    ...fs,
+    async lstat(path) {
+      const stat = await fs.lstat(path);
+      if (foreignOwner && path === file) stat.uid = process.getuid() + 1;
+      return stat;
+    },
+    readFile: testContext.mock.fn(fs.readFile),
+    open: testContext.mock.fn(fs.open),
+    rename: testContext.mock.fn(fs.rename),
+  };
+  const store = new SessionStore(dir, { io });
+  return {
+    load: () => store.load(),
+    save: () => store.save({ ...initial, lastSubmissionAt: 6 }),
+    async assertUntouched() {
+      for (const method of ['readFile', 'open', 'rename']) assert.equal(io[method].mock.callCount(), 0, method);
+      const after = await fs.stat(file);
+      assert.equal(after.mode, before.mode);
+      assert.equal(after.ino, before.ino);
+      assert.deepEqual(await fs.readFile(file), bytes);
+      assert.deepEqual(await fs.readdir(dir), ['sessions.json']);
+    },
+  };
+}
+
+test('session-store-private: load rejects open modes', async (context) => {
+  for (const mode of [0o644, 0o620]) {
+    const fixture = await privateStateFixture(context, mode);
+    await assert.rejects(fixture.load, { code: 'STATE_UNSAFE' });
+    await fixture.assertUntouched();
+  }
+});
+
+test('session-store-private: save preserves unsafe file', async (context) => {
+  for (const mode of [0o644, 0o620]) {
+    const fixture = await privateStateFixture(context, mode);
+    await assert.rejects(fixture.save, { code: 'STATE_UNSAFE' });
+    await fixture.assertUntouched();
+  }
+});
+
+test('session-store-private: rejects foreign owner', { skip: typeof process.getuid !== 'function' }, async (context) => {
+  const fixture = await privateStateFixture(context, 0o600, { foreignOwner: true });
+  await assert.rejects(fixture.load, { code: 'STATE_UNSAFE' });
+  await assert.rejects(fixture.save, { code: 'STATE_UNSAFE' });
+  await fixture.assertUntouched();
+});
+
+test('session-store-private: private file roundtrips', async () => {
+  const dir = await makeTmpDir();
+  const store = new SessionStore(dir);
+  const initial = { version: 1, lastSubmissionAt: 0, sessions: [] };
+  assert.deepEqual(await store.load(), initial);
+  assert.deepEqual(await fs.readdir(dir), []);
+  for (const lastSubmissionAt of [1, 2]) {
+    const state = { ...initial, lastSubmissionAt };
+    await store.save(state);
+    assert.equal((await fs.stat(store.file)).mode & 0o777, 0o600);
+    assert.deepEqual(await store.load(), state);
+  }
+});
+
 test('store: corrupt state is rejected, never reset', async () => {
   const dir = await makeTmpDir();
   const file = join(dir, 'sessions.json');
-  await fs.writeFile(file, '{oops');
+  await fs.writeFile(file, '{oops', { mode: 0o600 });
   const store = new SessionStore(dir);
   await assert.rejects(() => store.load(), (e) => e.code === 'STATE_CORRUPT');
   await fs.writeFile(file, JSON.stringify({ version: 3, lastSubmissionAt: 0, sessions: [] }));
@@ -473,6 +545,13 @@ test('bridge: doctor does a read-only org request', async () => {
   assert.equal(d.authenticated, true);
   assert.equal(d.orgId, fx.ORG_ID);
   assert.equal(d.protocol, 'rest-sse');
+  assert.deepEqual(d.attachments, {
+    configured: false,
+    source: null,
+    configFile: null,
+    environmentVariable: 'CCW_ATTACHMENT_ROOT',
+    supported: true,
+  });
   assert.ok(d.browser);
   assert.deepEqual(service.posts('/completion'), []);
 });

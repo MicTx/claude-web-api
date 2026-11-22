@@ -150,6 +150,9 @@ test('cli: doctor via fake CDP reports authenticated org without sending', async
     assert.equal(result.authenticated, true);
     assert.equal(result.orgId, fx.ORG_ID);
     assert.equal(result.protocol, 'rest-sse');
+    assert.equal(result.attachments.configured, false);
+    assert.equal(result.attachments.source, null);
+    assert.equal(result.attachments.environmentVariable, 'CCW_ATTACHMENT_ROOT');
     assert.equal(service.posts('/completion').length, 0);
     assert.deepEqual(server.closedTargets, [server.createdTargets[0].targetId]);
   });
@@ -336,6 +339,86 @@ test('attachments: mcp accepts finite lists and returns only file metadata', asy
       assert.equal(result.structuredContent.base64, undefined);
       assert.equal(service.uploads.length, 1);
       assert.equal(service.nativeSends.length, 2);
+    } finally { await client.close(); }
+  });
+});
+
+test('attachments: mcp reads the approved root from startup config when env is filtered', async () => {
+  await withServer(async (service, server) => {
+    const home = await makeTmpDir();
+    const configDir = join(home, '.config', 'claude-web-api');
+    const approved = join(home, 'approved');
+    await fsp.mkdir(configDir, { recursive: true });
+    await fsp.mkdir(approved);
+    await fsp.writeFile(join(configDir, 'config.json'), JSON.stringify({ attachmentRoot: '~/approved' }), { mode: 0o600 });
+    const selectedPath = join(approved, 'sample.js');
+    await fsp.writeFile(selectedPath, fx.SAMPLE_CODE);
+    const client = await mcpClient({ stateDir: home, cdpUrl: server.cdpUrl });
+    try {
+      const doctor = await client.callTool({ name: 'claude_doctor', arguments: {} });
+      assert.equal(doctor.structuredContent.attachments.configured, true);
+      assert.equal(doctor.structuredContent.attachments.source, 'config');
+      const ask = await client.callTool({ name: 'claude_ask', arguments: {
+        session: 'config-files', prompt: 'inspect', attachments: [selectedPath],
+      } });
+      assert.equal(ask.structuredContent.ok, true, JSON.stringify(ask.structuredContent));
+      assert.equal(service.uploads.length, 1);
+    } finally { await client.close(); }
+  });
+});
+
+test('attachments: mcp refuses missing scope before creating a session or pending request', async () => {
+  await withServer(async (service, server) => {
+    const home = await makeTmpDir();
+    const selected = join(home, 'sample.js');
+    await fsp.writeFile(selected, fx.SAMPLE_CODE);
+    const client = await mcpClient({ stateDir: home, cdpUrl: server.cdpUrl });
+    try {
+      const doctor = await client.callTool({ name: 'claude_doctor', arguments: {} });
+      assert.deepEqual(doctor.structuredContent.attachments, {
+        configured: false,
+        source: null,
+        configFile: '$HOME/.config/claude-web-api/config.json',
+        environmentVariable: 'CCW_ATTACHMENT_ROOT',
+        supported: true,
+      });
+      const requestsBefore = service.requests.length;
+      const targetsBefore = server.createdTargets.length;
+      const ask = await client.callTool({ name: 'claude_ask', arguments: {
+        session: 'missing-scope', prompt: 'inspect', attachments: [selected],
+      } });
+      assert.equal(ask.structuredContent.error.code, 'ATTACHMENT_SCOPE');
+      assert.match(ask.structuredContent.error.message, /config\.json/);
+      const sessions = await client.callTool({ name: 'claude_sessions', arguments: {} });
+      assert.deepEqual(sessions.structuredContent.sessions, []);
+      assert.equal(service.requests.length, requestsBefore);
+      assert.equal(service.uploads?.length ?? 0, 0);
+      assert.equal(server.createdTargets.length, targetsBefore);
+    } finally { await client.close(); }
+  });
+});
+
+test('attachments: mcp text sends work without an approved root', async () => {
+  await withServer(async (service, server) => {
+    const home = await makeTmpDir();
+    const client = await mcpClient({ stateDir: home, cdpUrl: server.cdpUrl });
+    try {
+      for (const [session, args] of [
+        ['text-no-attachments', { session: 'text-no-attachments', prompt: 'plain text' }],
+        ['text-empty-attachments', { session: 'text-empty-attachments', prompt: 'plain text', attachments: [] }],
+      ]) {
+        const ask = await client.callTool({ name: 'claude_ask', arguments: args });
+        assert.equal(ask.structuredContent.ok, true, JSON.stringify(ask.structuredContent));
+        assert.equal(ask.structuredContent.reply, 'Claude reply text');
+        assert.equal(ask.structuredContent.session, session);
+      }
+      const sessions = await client.callTool({ name: 'claude_sessions', arguments: {} });
+      assert.deepEqual(sessions.structuredContent.sessions.map(({ session, pending }) => ({ session, pending })), [
+        { session: 'text-no-attachments', pending: null },
+        { session: 'text-empty-attachments', pending: null },
+      ]);
+      assert.equal(service.uploads?.length ?? 0, 0);
+      assert.equal(service.posts('/completion').length, 2);
     } finally { await client.close(); }
   });
 });
